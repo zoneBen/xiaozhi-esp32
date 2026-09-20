@@ -1,0 +1,65 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include <driver/gpio.h>
+
+#define AUDIO_INPUT_SAMPLE_RATE  24000
+#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+
+#define AUDIO_I2S_GPIO_MCLK GPIO_NUM_4
+#define AUDIO_I2S_GPIO_WS   GPIO_NUM_7
+#define AUDIO_I2S_GPIO_BCLK GPIO_NUM_5
+#define AUDIO_I2S_GPIO_DIN  GPIO_NUM_6
+#define AUDIO_I2S_GPIO_DOUT GPIO_NUM_8
+
+#define AUDIO_CODEC_USE_PCA9557
+#define AUDIO_CODEC_PA_PIN       GPIO_NUM_NC
+#define AUDIO_CODEC_I2C_SCL_PIN  GPIO_NUM_15
+#define AUDIO_CODEC_I2C_SDA_PIN  GPIO_NUM_16
+#define AUDIO_CODEC_ES8311_ADDR  ES8311_CODEC_DEFAULT_ADDR
+#define AUDIO_CODEC_ES7210_ADDR  0x82
+
+// GPIO1 拉低用于使能板载音频功放
+#define AUDIO_PA_ENABLE_PIN      GPIO_NUM_1
+
+#define BUILTIN_LED_GPIO        GPIO_NUM_NC
+#define BOOT_BUTTON_GPIO        GPIO_NUM_0
+#define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_NC
+#define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
+
+#define DISPLAY_SPI_SCK_PIN     GPIO_NUM_12
+#define DISPLAY_SPI_MOSI_PIN    GPIO_NUM_11
+#define DISPLAY_DC_PIN          GPIO_NUM_46
+#define DISPLAY_SPI_CS_PIN      GPIO_NUM_10
+
+/******横屏显示******/
+#define DISPLAY_WIDTH   320
+#define DISPLAY_HEIGHT  240
+#define DISPLAY_MIRROR_X false
+#define DISPLAY_MIRROR_Y true
+#define DISPLAY_SWAP_XY true
+
+/******竖屏显示（可选）******/
+/*
+#define DISPLAY_WIDTH   240
+#define DISPLAY_HEIGHT  320
+#define DISPLAY_MIRROR_X false
+#define DISPLAY_MIRROR_Y false
+#define DISPLAY_SWAP_XY false
+*/
+
+#define DISPLAY_OFFSET_X  0
+#define DISPLAY_OFFSET_Y  0
+
+#define DISPLAY_BACKLIGHT_PIN          GPIO_NUM_45
+#define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
+
+// ML307R 4G 模块，接在 UART1 上（GPIO43 / GPIO44）
+// 注意：GPIO43/44 是 ESP32-S3 上 UART0 控制台的 IOMUX 默认引脚。
+// AtUart 走 UART1，uart_set_pin() 会用 GPIO 矩阵接管这两个引脚并摘掉其 IOMUX 功能，
+// 因此控制台日志不再从 GPIO43 输出（避免乱码灌进模块），改从原生 USB 口查看。
+#define ML307_TX_PIN            GPIO_NUM_43
+#define ML307_RX_PIN            GPIO_NUM_44
+#define ML307_DTR_PIN           GPIO_NUM_NC
+
+#endif // _BOARD_CONFIG_H_
