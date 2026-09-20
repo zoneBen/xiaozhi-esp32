@@ -7,12 +7,15 @@
 #include "button.h"
 #include "config.h"
 #include "ft6336_touch.h"
+#include "mcp_server.h"
 #include "quandong_s3_dev_4g_display.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <wifi_station.h>
 
 #include <memory>
@@ -116,6 +119,104 @@ private:
         });
     }
 
+    static const char* NetworkTypeName(NetworkType type) {
+        return type == NetworkType::ML307 ? "4G" : "Wi-Fi";
+    }
+
+    // 把工具参数归一化成 NetworkType。AI 未必严格按 schema 传 "wifi"/"4g"，
+    // 常见同义词一并接受。返回 false 表示参数无法识别
+    static bool ParseNetworkType(const std::string& text, NetworkType& type) {
+        if (text == "wifi" || text == "wi-fi" || text == "wlan") {
+            type = NetworkType::WIFI;
+            return true;
+        }
+        if (text == "4g" || text == "cellular" || text == "lte" || text == "ml307") {
+            type = NetworkType::ML307;
+            return true;
+        }
+        return false;
+    }
+
+    // 通过对话切换网络。工具回调跑在 Application 主任务上（McpServer::DoToolCall 用
+    // Schedule 派发），所以这里只做判定和安排，真正等回复 / 重启都交给独立任务
+    ToolResult HandleSetNetworkType(const PropertyList& properties) {
+        const std::string& requested = properties["type"].value<std::string>();
+        NetworkType target;
+        if (!ParseNetworkType(requested, target)) {
+            return std::unexpected("Invalid network type: " + requested +
+                                   ", expected `wifi` or `4g`");
+        }
+
+        // 已经在目标网络上就别重启了，白白断一次线
+        if (GetNetworkType() == target) {
+            return std::string("Already using ") + NetworkTypeName(target) +
+                   ", nothing to switch.";
+        }
+
+        // 升级过程中重启会打断固件写入，和触摸切换保持一致
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateUpgrading) {
+            return std::unexpected("Firmware upgrade in progress, cannot switch network now");
+        }
+
+        ScheduleNetworkSwitch();
+        ESP_LOGI(TAG, "AI 请求切换到 %s", NetworkTypeName(target));
+        return std::string("Switching to ") + NetworkTypeName(target) +
+               ", the device will reboot in a few seconds.";
+    }
+
+    void ScheduleNetworkSwitch() {
+        xTaskCreate([](void* arg) {
+            static_cast<QuandongS3Dev4GBoard*>(arg)->WaitForReplyThenSwitch();
+            vTaskDelete(nullptr);
+        }, "net_switch", 4096, this, 3, nullptr);
+    }
+
+    // SwitchNetworkType() 内部是「提示 + 延时 1s + 重启」，但 AI 的语音回复（"正在切换到 4G"）
+    // 是在工具返回之后才由服务端下发的 —— 立刻重启会把这句话掐掉，所以等它播完再切。
+    // 只能轮询设备状态：协议层没有「回复播完」的回调，而 kDeviceStateSpeaking 正是播放中。
+    void WaitForReplyThenSwitch() {
+        auto& app = Application::GetInstance();
+        constexpr int kPollMs = 100;
+        constexpr int kMinWaitMs = 4000;   // 工具返回到 TTS 出声有秒级延迟，先无条件等一段
+        constexpr int kMaxWaitMs = 15000;  // 兜底：回复异常时不能把设备一直挂着
+
+        int waited = 0;
+        bool seen_speaking = false;
+        while (waited < kMaxWaitMs) {
+            const bool speaking = (app.GetDeviceState() == kDeviceStateSpeaking);
+            seen_speaking = seen_speaking || speaking;
+            // 见过 speaking 且已经结束 → 回复播完；一次都没见过 → 至少等到 kMinWaitMs
+            if (seen_speaking ? !speaking : waited >= kMinWaitMs) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kPollMs));
+            waited += kPollMs;
+        }
+
+        if (!seen_speaking) {
+            ESP_LOGW(TAG, "等待 %dms 未见语音回复，直接切换网络", waited);
+        }
+        SwitchNetworkType();
+    }
+
+    // 自定义 MCP 工具必须注册在板子的 InitializeTools() 里（见 mcp_server.cc 的说明）
+    void InitializeTools() {
+        McpServer::GetInstance().AddTool(
+            "self.network.set_type",
+            "Switch the device's network connection between Wi-Fi and 4G (cellular).\n"
+            "Only call this when the user explicitly asks to change the network. The device "
+            "saves the choice and then reboots to apply it, so the audio channel will be closed "
+            "shortly after this tool returns.\n"
+            "If you do not know which network is currently in use, call "
+            "`self.get_device_status` first and look at `network.type` (`wifi` or `cellular`).\n"
+            "Args:\n"
+            "  `type`: `wifi` or `4g`.",
+            PropertyList({Property("type", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                return HandleSetNetworkType(properties);
+            });
+    }
+
     // 触摸屏初始化：复位 + 探测芯片。失败只打日志，不影响其它功能
     void InitializeFt6336Touch() {
         auto touch = std::make_unique<Ft6336Touch>(codec_i2c_bus_, TOUCH_I2C_ADDR, TOUCH_RST_PIN);
@@ -212,6 +313,7 @@ public:
         RegisterFt6336Indev();
         InitializeNetworkSwitchByTouch();
         InitializeButtons();
+        InitializeTools();
         GetBacklight()->SetBrightness(100);
     }
 
