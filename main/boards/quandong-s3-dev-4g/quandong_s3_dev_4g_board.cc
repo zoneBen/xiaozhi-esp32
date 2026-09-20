@@ -3,14 +3,19 @@
 #include "display/lcd_display.h"
 #include "esp_lcd_ili9341.h"
 #include "application.h"
+#include "assets/lang_config.h"
 #include "button.h"
 #include "config.h"
+#include "ft6336_touch.h"
+#include "quandong_s3_dev_4g_display.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
+
+#include <memory>
 
 #define TAG "QuandongS3Dev4GBoard"
 
@@ -44,7 +49,8 @@ class QuandongS3Dev4GBoard : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     Button boot_button_;
-    LcdDisplay* display_ = nullptr;
+    QuandongS3Dev4GDisplay* display_ = nullptr;
+    std::unique_ptr<Ft6336Touch> touch_;  // 触摸屏不存在时保持 nullptr
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -110,6 +116,48 @@ private:
         });
     }
 
+    // 触摸屏初始化：复位 + 探测芯片。失败只打日志，不影响其它功能
+    void InitializeFt6336Touch() {
+        auto touch = std::make_unique<Ft6336Touch>(codec_i2c_bus_, TOUCH_I2C_ADDR, TOUCH_RST_PIN);
+        if (!touch->Init()) {
+            ESP_LOGW(TAG, "未找到 FT6336 触摸屏，本次启动不带触摸（BOOT 双击仍可切换网络）");
+            return;
+        }
+        touch_ = std::move(touch);
+    }
+
+    void RegisterFt6336Indev() {
+        if (touch_ == nullptr || display_ == nullptr) {
+            return;
+        }
+        // lv_indev_create() 会改动 LVGL 内部结构，必须持锁调用
+        DisplayLockGuard lock(display_);
+        if (!lock) {
+            ESP_LOGE(TAG, "加锁失败，触摸屏未注册");
+            return;
+        }
+        touch_->RegisterLvglIndev();
+    }
+
+    // 触摸屏只承担「点左上角网络图标切换 WiFi / 4G」这一个交互，业务逻辑都留在板子里，
+    // 显示层只提供「图标可点 + 弹确认框」这两个 UI 能力
+    void InitializeNetworkSwitchByTouch() {
+        display_->SetNetworkIconTappedHandler([this]() {
+            auto& app = Application::GetInstance();
+            // 升级过程中重启会打断固件写入，这里直接忽略点击
+            if (app.GetDeviceState() == kDeviceStateUpgrading) {
+                ESP_LOGW(TAG, "固件升级中，忽略网络切换请求");
+                return;
+            }
+            const bool to_4g = (GetNetworkType() == NetworkType::WIFI);
+            display_->ShowConfirmDialog(
+                to_4g ? Lang::Strings::SWITCH_TO_4G_NETWORK : Lang::Strings::SWITCH_TO_WIFI_NETWORK,
+                // SwitchNetworkType() 内部会提示 + 延时 1s + 重启，不能占着 LVGL 任务跑，
+                // 丢回主任务执行（否则那句提示根本来不及绘制出来）
+                [this]() { Application::GetInstance().Schedule([this]() { SwitchNetworkType(); }); });
+        });
+    }
+
     void InitializeIli9341Display() {
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
@@ -146,7 +194,7 @@ private:
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         esp_lcd_panel_disp_on_off(panel, true);
 
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        display_ = new QuandongS3Dev4GDisplay(panel_io, panel,
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
@@ -158,7 +206,11 @@ public:
         InitializeI2c();
         InitializeSpi();
         InitializeAudioPaEnable();
+        // 触摸必须先于显示初始化：I2C 总线已就绪，且要把触摸设备注册进 LVGL
+        InitializeFt6336Touch();
         InitializeIli9341Display();
+        RegisterFt6336Indev();
+        InitializeNetworkSwitchByTouch();
         InitializeButtons();
         GetBacklight()->SetBrightness(100);
     }

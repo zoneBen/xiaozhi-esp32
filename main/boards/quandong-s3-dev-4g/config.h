@@ -54,6 +54,13 @@
 #define DISPLAY_BACKLIGHT_PIN          GPIO_NUM_45
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 
+// FT6336G 电容触摸屏，与 ES8311 共用 I2C0（详见 README.md）
+#define TOUCH_I2C_SDA_PIN       GPIO_NUM_16
+#define TOUCH_I2C_SCL_PIN       GPIO_NUM_15
+#define TOUCH_RST_PIN           GPIO_NUM_18
+#define TOUCH_INT_PIN           GPIO_NUM_17  // 预留：当前用轮询，未接中断
+#define TOUCH_I2C_ADDR          0x38
+
 // ML307R 4G 模块，接在 UART1 上（GPIO43 / GPIO44）
 // 注意：GPIO43/44 是 ESP32-S3 上 UART0 控制台的 IOMUX 默认引脚。
 // AtUart 走 UART1，uart_set_pin() 会用 GPIO 矩阵接管这两个引脚并摘掉其 IOMUX 功能，
