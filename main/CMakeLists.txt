@@ -1169,6 +1169,18 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
             endif()
         endif()
     endif()
+
+    # ThorVG (vendored inside LVGL, used by the vector graphic API) guards a
+    # signed-char test with `encoded[3] < 0`. char is unsigned on Xtensa, so on
+    # this target that comparison is dead code, and -Wtype-limits (part of
+    # -Wextra, with ESP-IDF's default -Werror) rejects it. Relax that one
+    # warning class for the vendored component only; our own code keeps it.
+    if(CONFIG_LV_USE_THORVG)
+        idf_component_get_property(lvgl_thorvg_lib lvgl__lvgl COMPONENT_LIB)
+        if(lvgl_thorvg_lib)
+            target_compile_options(${lvgl_thorvg_lib} PRIVATE -Wno-type-limits)
+        endif()
+    endif()
 endif()
 
 # Add generation rules

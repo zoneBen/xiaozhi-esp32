@@ -2,7 +2,10 @@
 
 #include "lvgl_theme.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_random.h>
+#include <esp_timer.h>
 #include <material_symbols.h>
 
 #define TAG "QuandongS3Dev4GDisplay"
@@ -28,6 +31,35 @@ constexpr int kButtonHeight = 44;
 constexpr uint32_t kConfirmBgColor = 0x2E7D32;  // Material Green 800
 constexpr uint32_t kCancelBgColor = 0x616161;   // Material Grey 700
 
+#if LV_USE_VECTOR_GRAPHIC
+// 猫脸画布边长，与 cat_face::kCanvasSize 同值：几何层按 1:1 的 168x168
+// 逻辑空间作画，所以画布尺寸必须与它一致，否则整张脸会错位或缩水。
+constexpr int kCatCanvasSize = cat_face::kCanvasSize;
+// 30fps。与仓库里 LvglGif 的刷新周期一致。
+constexpr uint32_t kCatFramePeriodMs = 33;
+// 线宽。几何层默认值就是 3.0f，这里显式写出来是为了让它可见可调；
+// 颜色不写死，每帧从主题的 text_color 取，换主题就跟着换。
+constexpr float kCatLineWidth = 3.0f;
+// 单帧 dt 的上限。浅睡期间 LVGL 整体停摆（sleep_timer.cc 里的 lvgl_port_stop），
+// 唤醒后第一帧算出来的间隔可能是好几秒，不钳住姿态会直接跳过去。
+constexpr int64_t kCatMaxStepUs = 100000;  // 100ms
+// 每这么多帧汇总一条渲染耗时日志（约 10 秒一条），用来核对 33ms 的帧预算
+constexpr uint32_t kCatStatsFrames = 300;
+
+// ---------------------------------------------------------------- 渲染后端
+// 几何层（cat_face.h）只认 cat_face::PathSink，两种实现都放在 cat_face_lvgl.*：
+//   kPrimitive —— 用 LVGL 自己的线段 / 三角形图元画，整帧不碰 thorvg。默认。
+//   kVector    —— 走 LVGL 矢量路径再交给 thorvg 光栅化，也就是原来那版。
+// 默认选 kPrimitive 的原因：kVector 每帧都要新建一次 thorvg 的 sw canvas、画完
+// 立刻拆掉，而 thorvg 的 C++ 对象走 IDF 堆、它内部被替换过的 malloc/free 又走
+// LVGL 的池，两套分配器在同一条释放路径上相遇 —— 开机第一次画脸就会炸在
+// heap_caps_free → find_containing_heap 上（串口逐条路径定位到了第 7 条路径的
+// 拆解阶段）。kPrimitive 全程只用 LVGL 的分配器，绕开这个组合。
+// 代价只有一处：曲线按 0.5px 容差折线化后再画，其余是精确等价。
+enum class CatRenderBackend { kPrimitive, kVector };
+constexpr CatRenderBackend kCatBackend = CatRenderBackend::kPrimitive;
+#endif
+
 }  // namespace
 
 QuandongS3Dev4GDisplay::QuandongS3Dev4GDisplay(esp_lcd_panel_io_handle_t panel_io,
@@ -35,9 +67,19 @@ QuandongS3Dev4GDisplay::QuandongS3Dev4GDisplay(esp_lcd_panel_io_handle_t panel_i
                                                int offset_x, int offset_y, bool mirror_x,
                                                bool mirror_y, bool swap_xy)
     : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y,
-                    swap_xy) {}
+                    swap_xy)
+#if LV_USE_VECTOR_GRAPHIC
+      ,
+      // 用真实熵做种子：每次开机猫的微表情都不一样
+      cat_animator_(esp_random())
+#endif
+{
+}
 
 QuandongS3Dev4GDisplay::~QuandongS3Dev4GDisplay() {
+#if LV_USE_VECTOR_GRAPHIC
+    DestroyCatFace();
+#endif
     // 弹窗挂在 lv_layer_top() 上，不在基类析构负责的 label 之列，这里自己收掉
     if (dialog_ != nullptr) {
         lv_obj_delete(dialog_);
@@ -56,6 +98,75 @@ void QuandongS3Dev4GDisplay::SetupUI() {
         return;
     }
     CreateNetworkTapArea();
+#if LV_USE_VECTOR_GRAPHIC
+    CreateCatFace();
+#endif
+}
+
+void QuandongS3Dev4GDisplay::SetEmotion(const char* emotion) {
+#if LV_USE_VECTOR_GRAPHIC
+    cat_face::Emotion parsed = cat_face::Emotion::kNeutral;
+    const bool handled_here =
+        (emotion != nullptr) && cat_face::ParseEmotion(emotion, parsed) && (cat_canvas_ != nullptr);
+
+    if (handled_here) {
+        DisplayLockGuard lock(this);
+        if (!lock) {
+            ESP_LOGE(TAG, "加锁失败，表情未切换");
+            return;
+        }
+        // 基类那条路上的 GIF 控制器要停掉，否则它会继续按帧去更新一个看不见的 image
+        if (gif_controller_) {
+            gif_controller_->Stop();
+            gif_controller_.reset();
+        }
+        if (emoji_label_ != nullptr) {
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_image_ != nullptr) {
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        cat_animator_.SetEmotion(parsed);
+        // 时间基准清零，下一帧从 dt=0 起算，不会把上一个情绪的停留时长补进这一帧
+        cat_last_frame_us_ = 0;
+        lv_obj_remove_flag(cat_canvas_, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGD(TAG, "猫脸表情: %s", cat_face::EmotionName(parsed));
+        return;
+    }
+#endif
+
+    // 名字不是猫脸认得的那 21 个，或者画布压根没建起来（内存不足 / 矢量开关关掉了）：
+    // 整体交回基类，让位图 / GIF / 字体图标三档兜底，再把自己藏起来
+    LcdDisplay::SetEmotion(emotion);
+#if LV_USE_VECTOR_GRAPHIC
+    if (cat_canvas_ != nullptr) {
+        DisplayLockGuard lock(this);
+        lv_obj_add_flag(cat_canvas_, LV_OBJ_FLAG_HIDDEN);
+    }
+#endif
+}
+
+void QuandongS3Dev4GDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+    // 基类在预览期间会把 emoji_box_ 整体隐藏，画布作为它的子对象自然也跟着不见，
+    // 所以这里只需要把定时器一并停掉，省下被遮住那几帧的绘制开销。
+    // preview_image_ 为空说明 SetupUI() 还没跑，基类会直接返回、什么都不做，
+    // 这时也不能去动定时器的状态，否则会停在暂停态再也恢复不了。
+    const bool preview_requested = (image != nullptr) && (preview_image_ != nullptr);
+
+    LcdDisplay::SetPreviewImage(std::move(image));
+
+#if LV_USE_VECTOR_GRAPHIC
+    DisplayLockGuard lock(this);
+    // 进出预览都把时间基准清零，恢复时不会把整个预览时长当成一帧的 dt 补进去
+    cat_last_frame_us_ = 0;
+    if (cat_timer_ != nullptr) {
+        if (preview_requested) {
+            lv_timer_pause(cat_timer_);
+        } else {
+            lv_timer_resume(cat_timer_);
+        }
+    }
+#endif
 }
 
 void QuandongS3Dev4GDisplay::CreateNetworkTapArea() {
@@ -221,3 +332,183 @@ void QuandongS3Dev4GDisplay::OnConfirmClicked(lv_event_t* event) {
         on_confirm();
     }
 }
+
+#if LV_USE_VECTOR_GRAPHIC
+
+void QuandongS3Dev4GDisplay::CreateCatFace() {
+    if (cat_canvas_ != nullptr || emoji_box_ == nullptr) {
+        return;
+    }
+
+    const uint32_t stride =
+        lv_draw_buf_width_to_stride(kCatCanvasSize, LV_COLOR_FORMAT_ARGB8888);
+    const size_t bytes = static_cast<size_t>(stride) * kCatCanvasSize;
+
+    // 像素得从堆上要，不能走 lv_draw_buf_create()：CONFIG_LV_USE_BUILTIN_MALLOC=y
+    // 时 lv_malloc 走的是 LVGL 自己的 TLSF 池（CONFIG_LV_MEM_SIZE_KILOBYTES=1024），
+    // 把这块 110KB 塞进去会直接挤掉 UI 自己的内存。
+    cat_pixels_ = heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (cat_pixels_ == nullptr) {
+        ESP_LOGW(TAG, "PSRAM 分配 %u 字节失败，猫脸画布回落到内部 RAM", (unsigned)bytes);
+        cat_pixels_ = heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (cat_pixels_ == nullptr) {
+        ESP_LOGE(TAG, "猫脸画布像素分配失败（%u 字节），表情回落到位图", (unsigned)bytes);
+        return;
+    }
+
+    cat_draw_buf_ = static_cast<lv_draw_buf_t*>(lv_malloc(sizeof(lv_draw_buf_t)));
+    if (cat_draw_buf_ == nullptr) {
+        ESP_LOGE(TAG, "猫脸 draw buf 结构体分配失败，表情回落到位图");
+        heap_caps_free(cat_pixels_);
+        cat_pixels_ = nullptr;
+        return;
+    }
+    // lv_draw_buf_init() 会把 header.flags 清成 0，也就是说 lv_draw_buf_destroy()
+    // 既不会释放像素也不会释放结构体 —— 所以这里不调 destroy，两头都由本类自己收
+    if (lv_draw_buf_init(cat_draw_buf_, kCatCanvasSize, kCatCanvasSize, LV_COLOR_FORMAT_ARGB8888,
+                         stride, cat_pixels_, bytes) != LV_RESULT_OK) {
+        ESP_LOGE(TAG, "猫脸 draw buf 初始化失败，表情回落到位图");
+        lv_free(cat_draw_buf_);
+        cat_draw_buf_ = nullptr;
+        heap_caps_free(cat_pixels_);
+        cat_pixels_ = nullptr;
+        return;
+    }
+
+    // 画布挂在 emoji_box_ 下面：基类在预览图期间整体隐藏 emoji_box_，猫脸就跟着走，
+    // 不需要另外写一套显隐逻辑。层格式必须是 ARGB8888（见 cat_face_lvgl.h 的说明）。
+    cat_canvas_ = lv_canvas_create(emoji_box_);
+    lv_canvas_set_draw_buf(cat_canvas_, cat_draw_buf_);
+    lv_obj_set_size(cat_canvas_, kCatCanvasSize, kCatCanvasSize);
+    lv_obj_center(cat_canvas_);
+    // 画布自己画满整块，任何背景 / 边框 / 内边距都会盖住或挤偏猫脸
+    lv_obj_set_style_bg_opa(cat_canvas_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cat_canvas_, 0, 0);
+    lv_obj_set_style_pad_all(cat_canvas_, 0, 0);
+    lv_obj_set_style_radius(cat_canvas_, 0, 0);
+    lv_obj_set_style_shadow_width(cat_canvas_, 0, 0);
+
+    // 开机的机器人 logo 由猫脸接管：屏幕本身就是那张脸，不该躺着一个机器人图标
+    if (emoji_label_ != nullptr) {
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (emoji_image_ != nullptr) {
+        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    cat_animator_.SetEmotion(cat_face::Emotion::kNeutral);
+
+    cat_timer_ = lv_timer_create(OnCatTimer, kCatFramePeriodMs, this);
+    if (cat_timer_ == nullptr) {
+        ESP_LOGE(TAG, "猫脸定时器创建失败，表情回落到位图");
+        DestroyCatFace();
+        return;
+    }
+
+    // heap_caps 给的是未初始化内存，先立刻铺一帧上去，别让屏幕上出现一屏垃圾像素
+    DrawCatFrame();
+    ESP_LOGI(TAG, "猫脸画布已就绪 (%dx%d, %u 字节, %d fps)", kCatCanvasSize, kCatCanvasSize,
+             (unsigned)bytes, 1000 / static_cast<int>(kCatFramePeriodMs));
+}
+
+void QuandongS3Dev4GDisplay::DestroyCatFace() {
+    DisplayLockGuard lock(this);
+
+    // 顺序不能反：先停定时器保证不会再有回调进来，再删画布让 lv_canvas 不再引用像素，
+    // 最后才释放像素。反过来做的话，正在渲染的那一帧会读到已经还回去的内存。
+    if (cat_timer_ != nullptr) {
+        lv_timer_delete(cat_timer_);
+        cat_timer_ = nullptr;
+    }
+    if (cat_canvas_ != nullptr) {
+        lv_obj_delete(cat_canvas_);
+        cat_canvas_ = nullptr;
+    }
+    if (cat_draw_buf_ != nullptr) {
+        // flags 为 0，lv_draw_buf_destroy() 什么都不会释放，所以自己收结构体
+        lv_free(cat_draw_buf_);
+        cat_draw_buf_ = nullptr;
+    }
+    if (cat_pixels_ != nullptr) {
+        heap_caps_free(cat_pixels_);
+        cat_pixels_ = nullptr;
+    }
+    cat_last_frame_us_ = 0;
+}
+
+void QuandongS3Dev4GDisplay::DrawCatFrame() {
+    if (cat_canvas_ == nullptr || cat_draw_buf_ == nullptr) {
+        return;
+    }
+    if (lv_obj_has_flag(cat_canvas_, LV_OBJ_FLAG_HIDDEN)) {
+        // 当前情绪不是猫脸认得的那 21 个，画布被藏起来了，没必要白画
+        cat_last_frame_us_ = 0;
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    // 第一帧没有参考点，dt 记 0；浅睡唤醒后的间隔可能有好几秒，上限钳到 100ms
+    int64_t dt_us = (cat_last_frame_us_ != 0) ? (now_us - cat_last_frame_us_) : 0;
+    cat_last_frame_us_ = now_us;
+    if (dt_us < 0) {
+        dt_us = 0;
+    } else if (dt_us > kCatMaxStepUs) {
+        dt_us = kCatMaxStepUs;
+    }
+
+    // 每帧都取一次主题线色，换主题就跟着换，不需要额外覆写 SetTheme()
+    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    if (lvgl_theme != nullptr) {
+        const lv_color_t ink = lvgl_theme->text_color();
+        cat_animator_.SetInk(cat_face::RgbColor(ink.red, ink.green, ink.blue), kCatLineWidth);
+    }
+    cat_animator_.Tick(static_cast<uint32_t>(dt_us / 1000));
+
+    const int64_t start_us = esp_timer_get_time();
+
+    // 每帧都得先擦干净：猫脸并没有铺满整块画布，不擦的话上一帧的特征会留成残影
+    lv_canvas_fill_bg(cat_canvas_, lv_color_black(), LV_OPA_TRANSP);
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(cat_canvas_, &layer);
+    {
+        if (kCatBackend == CatRenderBackend::kVector) {
+            LvglPathSink sink(&layer);
+            cat_face::Draw(cat_animator_.pose(), sink);
+            // lv_draw_vector() 内部立刻 dispatch，flush 要在离开作用域前做掉
+            sink.Flush();
+        } else {
+            LvglPrimitiveSink sink(&layer);
+            cat_face::Draw(cat_animator_.pose(), sink);
+        }
+    }
+    lv_canvas_finish_layer(cat_canvas_, &layer);
+
+    const int64_t cost_us = esp_timer_get_time() - start_us;
+    cat_frame_us_sum_ += cost_us;
+    if (cost_us > cat_frame_us_max_) {
+        cat_frame_us_max_ = cost_us;
+    }
+    if (++cat_frame_count_ >= kCatStatsFrames) {
+        ESP_LOGI(TAG, "猫脸渲染 %u 帧: 平均 %lld us, 峰值 %lld us (周期 %u us)", cat_frame_count_,
+                 cat_frame_us_sum_ / cat_frame_count_, cat_frame_us_max_,
+                 kCatFramePeriodMs * 1000);
+        cat_frame_count_ = 0;
+        cat_frame_us_sum_ = 0;
+        cat_frame_us_max_ = 0;
+    }
+}
+
+void QuandongS3Dev4GDisplay::OnCatTimer(lv_timer_t* timer) {
+    auto* self = static_cast<QuandongS3Dev4GDisplay*>(lv_timer_get_user_data(timer));
+    if (self == nullptr) {
+        return;
+    }
+    // 本回调由 lv_timer_handler 调起，那条路径上 LVGL 锁已经由端口任务持着
+    // （esp_lvgl_port 的 task 是 lock -> lv_timer_handler -> unlock），
+    // 这里再取一次就是重入同一个递归锁，仓库里的 LvglGif 也是这么做的
+    self->DrawCatFrame();
+}
+
+#endif  // LV_USE_VECTOR_GRAPHIC

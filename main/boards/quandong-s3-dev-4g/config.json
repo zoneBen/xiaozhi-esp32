@@ -4,7 +4,11 @@
     "builds": [
         {
             "name": "quandong-s3-dev-4g",
-            "sdkconfig_append": []
+            "sdkconfig_append": [
+                "CONFIG_LV_USE_VECTOR_GRAPHIC=y",
+                "CONFIG_LV_USE_THORVG=y",
+                "CONFIG_LV_USE_THORVG_INTERNAL=y"
+            ]
         }
     ]
 }
