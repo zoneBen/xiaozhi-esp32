@@ -66,8 +66,7 @@ QuandongS3Dev4GDisplay::QuandongS3Dev4GDisplay(esp_lcd_panel_io_handle_t panel_i
                                                esp_lcd_panel_handle_t panel, int width, int height,
                                                int offset_x, int offset_y, bool mirror_x,
                                                bool mirror_y, bool swap_xy)
-    : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y,
-                    swap_xy)
+    : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy)
 #if LV_USE_VECTOR_GRAPHIC
       ,
       // 用真实熵做种子：每次开机猫的微表情都不一样
@@ -77,13 +76,25 @@ QuandongS3Dev4GDisplay::QuandongS3Dev4GDisplay(esp_lcd_panel_io_handle_t panel_i
 }
 
 QuandongS3Dev4GDisplay::~QuandongS3Dev4GDisplay() {
+    // 覆盖页先收：余额页析构会等正在进行的 HTTP 请求退出，
+    // 必须赶在 LVGL 端口被基类拆掉之前完成。
+    balance_ui_.reset();
+    settings_ui_.reset();
+
 #if LV_USE_VECTOR_GRAPHIC
     DestroyCatFace();
 #endif
-    // 弹窗挂在 lv_layer_top() 上，不在基类析构负责的 label 之列，这里自己收掉
-    if (dialog_ != nullptr) {
-        lv_obj_delete(dialog_);
-        dialog_ = nullptr;
+    {
+        DisplayLockGuard lock(this);
+        if (settings_tap_area_ != nullptr) {
+            lv_obj_delete(settings_tap_area_);
+            settings_tap_area_ = nullptr;
+        }
+        // 弹窗挂在 lv_layer_top() 上，不在基类析构负责的 label 之列，这里自己收掉
+        if (dialog_ != nullptr) {
+            lv_obj_delete(dialog_);
+            dialog_ = nullptr;
+        }
     }
 }
 
@@ -98,6 +109,7 @@ void QuandongS3Dev4GDisplay::SetupUI() {
         return;
     }
     CreateNetworkTapArea();
+    CreateSettingsButton();
 #if LV_USE_VECTOR_GRAPHIC
     CreateCatFace();
 #endif
@@ -195,6 +207,241 @@ void QuandongS3Dev4GDisplay::CreateNetworkTapArea() {
 
 void QuandongS3Dev4GDisplay::SetNetworkIconTappedHandler(std::function<void()> handler) {
     on_network_icon_tapped_ = std::move(handler);
+}
+
+void QuandongS3Dev4GDisplay::SetUiServices(UiServices services) {
+    ui_services_ = std::move(services);
+}
+
+void QuandongS3Dev4GDisplay::CreateSettingsButton() {
+    if (settings_button_ != nullptr || top_bar_ == nullptr) {
+        return;
+    }
+
+    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    if (lvgl_theme == nullptr || lvgl_theme->icon_font() == nullptr) {
+        ESP_LOGE(TAG, "主题未就绪，设置按钮未创建");
+        return;
+    }
+
+    // 基类 top_bar_ 的第二个子对象是右上角图标容器；把齿轮追加进去，
+    // 让电池 / 静音图标和齿轮共用同一条 flex 行，不额外占屏幕高度。
+    lv_obj_t* right_icons = lv_obj_get_child(top_bar_, 1);
+    if (right_icons == nullptr) {
+        right_icons = top_bar_;
+    }
+
+    settings_button_ = lv_button_create(right_icons);
+    lv_obj_set_size(settings_button_, 24, 24);
+    lv_obj_set_style_radius(settings_button_, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(settings_button_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(settings_button_, 0, 0);
+    lv_obj_set_style_shadow_width(settings_button_, 0, 0);
+    lv_obj_set_style_pad_all(settings_button_, 0, 0);
+    lv_obj_set_style_margin_left(settings_button_, 2, 0);
+    lv_obj_set_style_bg_color(settings_button_, lvgl_theme->text_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(settings_button_, LV_OPA_20, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(settings_button_, OnSettingsButtonClicked, LV_EVENT_CLICKED, this);
+
+    settings_icon_ = lv_label_create(settings_button_);
+    lv_label_set_text(settings_icon_, MATERIAL_SYMBOLS_SETTINGS);
+    const lv_font_t* icon_font = lvgl_theme->icon_font()->font();
+    if (lvgl_theme->text_font() != nullptr && lvgl_theme->text_font()->font() != nullptr &&
+        lvgl_theme->text_font()->font()->line_height >= 40) {
+        icon_font = lvgl_theme->large_icon_font()->font();
+    }
+    lv_obj_set_style_text_font(settings_icon_, icon_font, 0);
+    lv_obj_set_style_text_color(settings_icon_, lvgl_theme->text_color(), 0);
+    lv_obj_center(settings_icon_);
+    lv_obj_move_foreground(settings_button_);
+
+    // status_bar_ 在 top_bar_ 之后创建且默认 CLICKABLE，会盖住齿轮；
+    // 和左上角网络图标一样，用一块贴在屏幕右上角的透明热区接管触摸。
+    settings_tap_area_ = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(settings_tap_area_, 40, 40);
+    lv_obj_align(settings_tap_area_, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_bg_opa(settings_tap_area_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(settings_tap_area_, 0, 0);
+    lv_obj_set_style_radius(settings_tap_area_, 0, 0);
+    lv_obj_set_style_pad_all(settings_tap_area_, 0, 0);
+    lv_obj_set_style_shadow_width(settings_tap_area_, 0, 0);
+    lv_obj_set_scrollbar_mode(settings_tap_area_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(settings_tap_area_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(settings_tap_area_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(settings_tap_area_, OnSettingsButtonClicked, LV_EVENT_CLICKED, this);
+    lv_obj_move_foreground(settings_tap_area_);
+    ESP_LOGI(TAG, "设置按钮已创建");
+}
+
+void QuandongS3Dev4GDisplay::SetTheme(Theme* theme) {
+    SpiLcdDisplay::SetTheme(theme);
+
+    DisplayLockGuard lock(this);
+    if (!lock) {
+        return;
+    }
+    auto* lvgl_theme = static_cast<LvglTheme*>(theme);
+    if (lvgl_theme == nullptr) {
+        return;
+    }
+
+    if (settings_icon_ != nullptr && lvgl_theme->icon_font() != nullptr) {
+        const lv_font_t* icon_font = lvgl_theme->icon_font()->font();
+        if (lvgl_theme->text_font() != nullptr && lvgl_theme->text_font()->font() != nullptr &&
+            lvgl_theme->text_font()->font()->line_height >= 40) {
+            icon_font = lvgl_theme->large_icon_font()->font();
+        }
+        lv_obj_set_style_text_font(settings_icon_, icon_font, 0);
+        lv_obj_set_style_text_color(settings_icon_, lvgl_theme->text_color(), 0);
+    }
+    if (settings_button_ != nullptr) {
+        lv_obj_set_style_bg_color(settings_button_, lvgl_theme->text_color(), LV_STATE_PRESSED);
+    }
+    if (settings_ui_ != nullptr) {
+        settings_ui_->RefreshTheme();
+    }
+    if (balance_ui_ != nullptr) {
+        balance_ui_->RefreshTheme();
+    }
+}
+
+void QuandongS3Dev4GDisplay::ShowSettingsPage() {
+    DisplayLockGuard lock(this);
+    if (!lock) {
+        ESP_LOGE(TAG, "加锁失败，设置页未打开");
+        return;
+    }
+    ShowSettingsPageLocked();
+}
+
+void QuandongS3Dev4GDisplay::ShowSettingsPageLocked() {
+    SetOverlayActiveLocked(true);
+    CloseConfirmDialog();
+    if (balance_ui_ != nullptr) {
+        balance_ui_->Hide();
+    }
+    if (settings_ui_ == nullptr) {
+        settings_ui_ = std::make_unique<CatSettingsUi>(this, MakeSettingsCallbacks());
+    }
+    settings_ui_->Show();
+    SetOverlayActiveLocked(true);
+}
+
+void QuandongS3Dev4GDisplay::HideSettingsPageLocked() {
+    if (settings_ui_ != nullptr) {
+        settings_ui_->Hide();
+    }
+    SetOverlayActiveLocked(false);
+}
+
+void QuandongS3Dev4GDisplay::ShowBalancePage() {
+    DisplayLockGuard lock(this);
+    if (!lock) {
+        ESP_LOGE(TAG, "加锁失败，余额页未打开");
+        return;
+    }
+    ShowBalancePageLocked();
+}
+
+void QuandongS3Dev4GDisplay::ShowBalancePageLocked() {
+    SetOverlayActiveLocked(true);
+    CloseConfirmDialog();
+    if (settings_ui_ != nullptr) {
+        settings_ui_->Hide();
+    }
+    if (balance_ui_ == nullptr) {
+        balance_ui_ = std::make_unique<DeepSeekBalanceUi>(this, MakeBalanceCallbacks());
+    }
+    balance_ui_->Show();
+    SetOverlayActiveLocked(true);
+}
+
+void QuandongS3Dev4GDisplay::HideBalancePageLocked() {
+    if (balance_ui_ != nullptr) {
+        balance_ui_->Hide();
+    }
+    SetOverlayActiveLocked(false);
+}
+
+void QuandongS3Dev4GDisplay::SetOverlayActiveLocked(bool active) {
+    if (overlay_active_ == active) {
+        return;
+    }
+    overlay_active_ = active;
+#if LV_USE_VECTOR_GRAPHIC
+    // 覆盖页盖住整块屏幕，暂停猫脸定时器省 CPU；
+    // 恢复时清掉时间基准，避免把整段覆盖页停留时间当成一帧的 dt。
+    cat_last_frame_us_ = 0;
+    if (cat_timer_ != nullptr) {
+        if (active) {
+            lv_timer_pause(cat_timer_);
+        } else {
+            lv_timer_resume(cat_timer_);
+        }
+    }
+#endif
+}
+
+CatSettingsUi::Callbacks QuandongS3Dev4GDisplay::MakeSettingsCallbacks() {
+    CatSettingsUi::Callbacks callbacks;
+    callbacks.on_close = [this]() {
+        DisplayLockGuard lock(this);
+        if (lock) {
+            HideSettingsPageLocked();
+        }
+    };
+    callbacks.show_confirm = [this](const char* message, std::function<void()> on_confirm) {
+        ShowConfirmDialog(message, std::move(on_confirm));
+    };
+    auto clear_provisioning = ui_services_.clear_provisioning;
+    callbacks.on_clear_provisioning = [clear_provisioning]() {
+        if (clear_provisioning) {
+            clear_provisioning();
+        }
+    };
+    callbacks.on_token_changed = ui_services_.on_token_changed;
+    return callbacks;
+}
+
+DeepSeekBalanceUi::Callbacks QuandongS3Dev4GDisplay::MakeBalanceCallbacks() {
+    DeepSeekBalanceUi::Callbacks callbacks;
+    callbacks.load_token = []() { return deepseek::LoadToken(); };
+    auto fetch = ui_services_.fetch_balance;
+    callbacks.fetch = [fetch](const std::string& token, deepseek::BalanceInfo& info,
+                              std::string& error) -> bool {
+        if (!fetch) {
+            error = "余额服务未配置";
+            return false;
+        }
+        return fetch(token, info, error);
+    };
+    callbacks.on_close = [this]() {
+        DisplayLockGuard lock(this);
+        if (lock) {
+            HideBalancePageLocked();
+        }
+    };
+    callbacks.on_open_settings = [this]() {
+        // 本回调由余额页的按钮事件调起，LVGL 锁已经在手；
+        // 这里不恢复猫脸，因为下一帧就切到设置页。
+        if (balance_ui_ != nullptr) {
+            balance_ui_->Hide();
+        }
+        if (settings_ui_ == nullptr) {
+            settings_ui_ = std::make_unique<CatSettingsUi>(this, MakeSettingsCallbacks());
+        }
+        settings_ui_->Show();
+        settings_ui_->ShowTokenPage();
+        SetOverlayActiveLocked(true);
+    };
+    return callbacks;
+}
+
+void QuandongS3Dev4GDisplay::OnSettingsButtonClicked(lv_event_t* event) {
+    auto* self = static_cast<QuandongS3Dev4GDisplay*>(lv_event_get_user_data(event));
+    if (self != nullptr) {
+        self->ShowSettingsPage();
+    }
 }
 
 void QuandongS3Dev4GDisplay::ShowConfirmDialog(const char* message,
@@ -340,8 +587,7 @@ void QuandongS3Dev4GDisplay::CreateCatFace() {
         return;
     }
 
-    const uint32_t stride =
-        lv_draw_buf_width_to_stride(kCatCanvasSize, LV_COLOR_FORMAT_ARGB8888);
+    const uint32_t stride = lv_draw_buf_width_to_stride(kCatCanvasSize, LV_COLOR_FORMAT_ARGB8888);
     const size_t bytes = static_cast<size_t>(stride) * kCatCanvasSize;
 
     // 像素得从堆上要，不能走 lv_draw_buf_create()：CONFIG_LV_USE_BUILTIN_MALLOC=y
@@ -492,8 +738,7 @@ void QuandongS3Dev4GDisplay::DrawCatFrame() {
     }
     if (++cat_frame_count_ >= kCatStatsFrames) {
         ESP_LOGI(TAG, "猫脸渲染 %u 帧: 平均 %lld us, 峰值 %lld us (周期 %u us)", cat_frame_count_,
-                 cat_frame_us_sum_ / cat_frame_count_, cat_frame_us_max_,
-                 kCatFramePeriodMs * 1000);
+                 cat_frame_us_sum_ / cat_frame_count_, cat_frame_us_max_, kCatFramePeriodMs * 1000);
         cat_frame_count_ = 0;
         cat_frame_us_sum_ = 0;
         cat_frame_us_max_ = 0;

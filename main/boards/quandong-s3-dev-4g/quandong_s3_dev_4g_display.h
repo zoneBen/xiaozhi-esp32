@@ -3,11 +3,16 @@
 
 #include "cat_face_anim.h"
 #include "cat_face_lvgl.h"
+#include "cat_settings_ui.h"
+#include "deepseek_balance_ui.h"
+#include "deepseek_client.h"
 
 #include "display/lcd_display.h"
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <string>
 
 // quandong-s3-dev-4g 的显示层：在 SpiLcdDisplay 基础上
 //   1) 让状态栏左上角的网络图标（WiFi / 4G 信号）可点；
@@ -38,13 +43,40 @@ public:
     // message 只允许用内置字体内已有的文案（见 README 的字体字集说明）
     void ShowConfirmDialog(const char* message, std::function<void()> on_confirm);
 
+    // 板子注入的网络 / 重启能力。设置页和余额页只做 UI，
+    // 清配网与余额请求都从这里回到板级实现。
+    struct UiServices {
+        std::function<bool(const std::string& token, deepseek::BalanceInfo& info,
+                           std::string& error)>
+            fetch_balance;
+        std::function<void()> clear_provisioning;
+        std::function<void()> on_token_changed;
+    };
+    void SetUiServices(UiServices services);
+
+    // 供板卡 MCP 工具调用
+    void ShowBalancePage();
+
+    virtual void SetTheme(Theme* theme) override;
+
 private:
     static void OnTapAreaClicked(lv_event_t* event);
     static void OnConfirmClicked(lv_event_t* event);
     static void OnCancelClicked(lv_event_t* event);
+    static void OnSettingsButtonClicked(lv_event_t* event);
 
     void CreateNetworkTapArea();
+    void CreateSettingsButton();
     void CloseConfirmDialog();
+
+    void ShowSettingsPage();
+    void ShowSettingsPageLocked();
+    void HideSettingsPageLocked();
+    void ShowBalancePageLocked();
+    void HideBalancePageLocked();
+    void SetOverlayActiveLocked(bool active);
+    CatSettingsUi::Callbacks MakeSettingsCallbacks();
+    DeepSeekBalanceUi::Callbacks MakeBalanceCallbacks();
 
 #if LV_USE_VECTOR_GRAPHIC
     void CreateCatFace();
@@ -55,6 +87,13 @@ private:
 
     lv_obj_t* tap_area_ = nullptr;  // 左上角网络图标的透明触摸热区
     lv_obj_t* dialog_ = nullptr;    // 非空表示确认框已打开
+    lv_obj_t* settings_button_ = nullptr;
+    lv_obj_t* settings_icon_ = nullptr;
+    lv_obj_t* settings_tap_area_ = nullptr;
+    std::unique_ptr<CatSettingsUi> settings_ui_;
+    std::unique_ptr<DeepSeekBalanceUi> balance_ui_;
+    UiServices ui_services_;
+    bool overlay_active_ = false;
     std::function<void()> on_network_icon_tapped_;
     std::function<void()> on_confirm_;
 

@@ -7,7 +7,8 @@
             "sdkconfig_append": [
                 "CONFIG_LV_USE_VECTOR_GRAPHIC=y",
                 "CONFIG_LV_USE_THORVG=y",
-                "CONFIG_LV_USE_THORVG_INTERNAL=y"
+                "CONFIG_LV_USE_THORVG_INTERNAL=y",
+                "CONFIG_LV_USE_KEYBOARD=y"
             ]
         }
     ]

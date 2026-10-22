@@ -1,51 +1,61 @@
-#include "dual_network_board.h"
-#include "codecs/es8311_audio_codec.h"
-#include "display/lcd_display.h"
-#include "esp_lcd_ili9341.h"
 #include "application.h"
 #include "assets/lang_config.h"
 #include "button.h"
+#include "codecs/es8311_audio_codec.h"
 #include "config.h"
+#include "deepseek_client.h"
+#include "display/lcd_display.h"
+#include "dual_network_board.h"
+#include "esp_lcd_ili9341.h"
 #include "ft6336_touch.h"
 #include "mcp_server.h"
 #include "quandong_s3_dev_4g_display.h"
+#include "settings.h"
 
-#include <esp_log.h>
-#include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
+#include <esp_lcd_panel_vendor.h>
+#include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <ssid_manager.h>
 #include <wifi_station.h>
 
+#include <atomic>
 #include <memory>
 
 #define TAG "QuandongS3Dev4GBoard"
 
 // ILI9341 厂家自定义初始化序列
 static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
-    {0xCF, (uint8_t []){0x00, 0xC1, 0x30}, 3, 0},
-    {0xED, (uint8_t []){0x64, 0x03, 0x12, 0x81}, 4, 0},
-    {0xE8, (uint8_t []){0x85, 0x00, 0x78}, 3, 0},
-    {0xCB, (uint8_t []){0x39, 0x2C, 0x00, 0x34, 0x02}, 5, 0},
-    {0xF7, (uint8_t []){0x20}, 1, 0},
-    {0xEA, (uint8_t []){0x00, 0x00}, 2, 0},
-    {0xC0, (uint8_t []){0x13}, 1, 0},
-    {0xC1, (uint8_t []){0x13}, 1, 0},
-    {0xC5, (uint8_t []){0x22, 0x35}, 2, 0},
-    {0xC7, (uint8_t []){0xBD}, 1, 0},
-    {0, (uint8_t []){0}, 0x11, 0},
-    {0x36, (uint8_t []){0x08}, 1, 0},
-    {0xB6, (uint8_t []){0x0A, 0xA2}, 2, 0},
-    {0x3A, (uint8_t []){0x55}, 1, 0},
-    {0xF6, (uint8_t []){0x01, 0x30}, 2, 0},
-    {0xB1, (uint8_t []){0x00, 0x1B}, 2, 0},
-    {0xF2, (uint8_t []){0x00}, 1, 0},
-    {0x26, (uint8_t []){0x01}, 1, 0},
-    {0xE0, (uint8_t []){0x0F, 0x35, 0x31, 0x0B, 0x0E, 0x06, 0x49, 0xA7, 0x33, 0x07, 0x0F, 0x03, 0x0C, 0x0A, 0x00}, 15, 0},
-    {0xE1, (uint8_t []){0x00, 0x0A, 0x0F, 0x04, 0x11, 0x08, 0x36, 0x58, 0x4D, 0x07, 0x10, 0x0C, 0x32, 0x34, 0x0F}, 15, 0},
-    {0, (uint8_t []){0}, 0x11, 0},
-    {0, (uint8_t []){0}, 0x29, 0},
+    {0xCF, (uint8_t[]){0x00, 0xC1, 0x30}, 3, 0},
+    {0xED, (uint8_t[]){0x64, 0x03, 0x12, 0x81}, 4, 0},
+    {0xE8, (uint8_t[]){0x85, 0x00, 0x78}, 3, 0},
+    {0xCB, (uint8_t[]){0x39, 0x2C, 0x00, 0x34, 0x02}, 5, 0},
+    {0xF7, (uint8_t[]){0x20}, 1, 0},
+    {0xEA, (uint8_t[]){0x00, 0x00}, 2, 0},
+    {0xC0, (uint8_t[]){0x13}, 1, 0},
+    {0xC1, (uint8_t[]){0x13}, 1, 0},
+    {0xC5, (uint8_t[]){0x22, 0x35}, 2, 0},
+    {0xC7, (uint8_t[]){0xBD}, 1, 0},
+    {0, (uint8_t[]){0}, 0x11, 0},
+    {0x36, (uint8_t[]){0x08}, 1, 0},
+    {0xB6, (uint8_t[]){0x0A, 0xA2}, 2, 0},
+    {0x3A, (uint8_t[]){0x55}, 1, 0},
+    {0xF6, (uint8_t[]){0x01, 0x30}, 2, 0},
+    {0xB1, (uint8_t[]){0x00, 0x1B}, 2, 0},
+    {0xF2, (uint8_t[]){0x00}, 1, 0},
+    {0x26, (uint8_t[]){0x01}, 1, 0},
+    {0xE0,
+     (uint8_t[]){0x0F, 0x35, 0x31, 0x0B, 0x0E, 0x06, 0x49, 0xA7, 0x33, 0x07, 0x0F, 0x03, 0x0C, 0x0A,
+                 0x00},
+     15, 0},
+    {0xE1,
+     (uint8_t[]){0x00, 0x0A, 0x0F, 0x04, 0x11, 0x08, 0x36, 0x58, 0x4D, 0x07, 0x10, 0x0C, 0x32, 0x34,
+                 0x0F},
+     15, 0},
+    {0, (uint8_t[]){0}, 0x11, 0},
+    {0, (uint8_t[]){0}, 0x29, 0},
 };
 
 class QuandongS3Dev4GBoard : public DualNetworkBoard {
@@ -54,6 +64,8 @@ private:
     Button boot_button_;
     QuandongS3Dev4GDisplay* display_ = nullptr;
     std::unique_ptr<Ft6336Touch> touch_;  // 触摸屏不存在时保持 nullptr
+    NetworkEventCallback app_network_callback_;
+    std::atomic<bool> baseline_fetch_running_{false};
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -64,9 +76,10 @@ private:
             .glitch_ignore_cnt = 7,
             .intr_priority = 0,
             .trans_queue_depth = 0,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
+            .flags =
+                {
+                    .enable_internal_pullup = 1,
+                },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
     }
@@ -149,8 +162,7 @@ private:
 
         // 已经在目标网络上就别重启了，白白断一次线
         if (GetNetworkType() == target) {
-            return std::string("Already using ") + NetworkTypeName(target) +
-                   ", nothing to switch.";
+            return std::string("Already using ") + NetworkTypeName(target) + ", nothing to switch.";
         }
 
         // 升级过程中重启会打断固件写入，和触摸切换保持一致
@@ -165,10 +177,12 @@ private:
     }
 
     void ScheduleNetworkSwitch() {
-        xTaskCreate([](void* arg) {
-            static_cast<QuandongS3Dev4GBoard*>(arg)->WaitForReplyThenSwitch();
-            vTaskDelete(nullptr);
-        }, "net_switch", 4096, this, 3, nullptr);
+        xTaskCreate(
+            [](void* arg) {
+                static_cast<QuandongS3Dev4GBoard*>(arg)->WaitForReplyThenSwitch();
+                vTaskDelete(nullptr);
+            },
+            "net_switch", 4096, this, 3, nullptr);
     }
 
     // SwitchNetworkType() 内部是「提示 + 延时 1s + 重启」，但 AI 的语音回复（"正在切换到 4G"）
@@ -215,6 +229,101 @@ private:
             [this](const PropertyList& properties) -> ToolResult {
                 return HandleSetNetworkType(properties);
             });
+
+        McpServer::GetInstance().AddTool(
+            "self.deepseek.balance",
+            "Open the DeepSeek account balance page on the device screen and keep it refreshed "
+            "once per minute.\n"
+            "Call this whenever the user asks about DeepSeek balance, credit, remaining money, "
+            "or DeepSeek account information. Typical user phrases include: "
+            "\"查看余额\", \"查看大模型余额\", \"查看deepseek信息\", \"DeepSeek还有多少钱\", "
+            "\"查一下大模型余额\", \"check my DeepSeek balance\".\n"
+            "The page stays on screen until the user taps the back arrow. If the API token has "
+            "not been configured, the page shows a shortcut to the token settings; tell the user "
+            "to open the gear icon > DeepSeek Token.",
+            PropertyList(), [this](const PropertyList&) -> ToolResult {
+                if (display_ == nullptr) {
+                    return std::unexpected("Display is not ready");
+                }
+                display_->ShowBalancePage();
+                return std::string(
+                    "The DeepSeek balance page is now open on the screen. It refreshes every 60 "
+                    "seconds, and the user can tap the back arrow to return to the cat face. If "
+                    "the page reports a missing token, ask the user to open Settings (gear icon) "
+                    "and set DeepSeek Token first.");
+            });
+    }
+
+    // 开机/重连后各尝试一次，把“今日消耗”的基准总额写进 RAM。
+    // 已有基准或没有 Token 时直接返回；后台任务自己拿锁串行化 HTTP 请求。
+    void StartBalanceBaselineFetch() {
+        double total = 0.0;
+        std::string currency;
+        if (deepseek::GetBaseline(total, currency)) {
+            return;
+        }
+        if (deepseek::LoadToken().empty()) {
+            return;
+        }
+        bool expected = false;
+        if (!baseline_fetch_running_.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        if (xTaskCreate(BaselineTaskEntry, "ds_baseline", 8192, this, 2, nullptr) != pdPASS) {
+            baseline_fetch_running_.store(false);
+            ESP_LOGW(TAG, "创建余额基准任务失败");
+        }
+    }
+
+    void RunBalanceBaselineFetch() {
+        const std::string token = deepseek::LoadToken();
+        if (!token.empty()) {
+            std::string error;
+            if (deepseek::FetchAndStoreBaseline(token, error)) {
+                ESP_LOGI(TAG, "余额基准后台获取完成");
+            } else {
+                ESP_LOGW(TAG, "余额基准后台获取失败: %s", error.c_str());
+            }
+        }
+        baseline_fetch_running_.store(false);
+    }
+
+    static void BaselineTaskEntry(void* arg) {
+        auto* self = static_cast<QuandongS3Dev4GBoard*>(arg);
+        self->RunBalanceBaselineFetch();
+        vTaskDelete(nullptr);
+    }
+
+    // 设置页 / 余额页只做 UI，清配网和余额查询在板子里落地。
+    // clear_provisioning 从 LVGL 事件回调里调起，所以只做 Schedule，
+    // 让主任务去清 NVS 和重启，别把 LVGL 任务卡在 Reboot() 的 1 秒延时里。
+    void InitializeUiServices() {
+        if (display_ == nullptr) {
+            return;
+        }
+        display_->SetUiServices({
+            .fetch_balance =
+                [](const std::string& token, deepseek::BalanceInfo& info, std::string& error) {
+                    return deepseek::FetchBalance(token, info, error);
+                },
+            .clear_provisioning =
+                []() {
+                    ESP_LOGI(TAG, "清除配网设置并重启");
+                    Application::GetInstance().Schedule([]() {
+                        SsidManager::GetInstance().Clear();
+                        {
+                            Settings settings("network", true);
+                            settings.SetInt("type", 0);
+                        }
+                        Application::GetInstance().Reboot();
+                    });
+                },
+            .on_token_changed =
+                [this]() {
+                    deepseek::ResetBaseline();
+                    StartBalanceBaselineFetch();
+                },
+        });
     }
 
     // 触摸屏初始化：复位 + 探测芯片。失败只打日志，不影响其它功能
@@ -240,8 +349,8 @@ private:
         touch_->RegisterLvglIndev();
     }
 
-    // 触摸屏只承担「点左上角网络图标切换 WiFi / 4G」这一个交互，业务逻辑都留在板子里，
-    // 显示层只提供「图标可点 + 弹确认框」这两个 UI 能力
+    // 触摸屏承担两个交互：左上角网络图标切换 WiFi / 4G，右上角齿轮打开设置页。
+    // 业务逻辑都留在板子里，显示层只提供 UI 能力。
     void InitializeNetworkSwitchByTouch() {
         display_->SetNetworkIconTappedHandler([this]() {
             auto& app = Application::GetInstance();
@@ -255,7 +364,9 @@ private:
                 to_4g ? Lang::Strings::SWITCH_TO_4G_NETWORK : Lang::Strings::SWITCH_TO_WIFI_NETWORK,
                 // SwitchNetworkType() 内部会提示 + 延时 1s + 重启，不能占着 LVGL 任务跑，
                 // 丢回主任务执行（否则那句提示根本来不及绘制出来）
-                [this]() { Application::GetInstance().Schedule([this]() { SwitchNetworkType(); }); });
+                [this]() {
+                    Application::GetInstance().Schedule([this]() { SwitchNetworkType(); });
+                });
         });
     }
 
@@ -285,7 +396,7 @@ private:
         panel_config.flags.reset_active_high = 1;
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = (void *)&vendor_config;
+        panel_config.vendor_config = (void*)&vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(panel_io, &panel_config, &panel));
 
         esp_lcd_panel_reset(panel);
@@ -295,21 +406,23 @@ private:
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         esp_lcd_panel_disp_on_off(panel, true);
 
-        display_ = new QuandongS3Dev4GDisplay(panel_io, panel,
-            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
-            DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new QuandongS3Dev4GDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                              DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                              DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
 public:
     // 末位参数为默认网络类型：0 = WiFi 优先，1 = 4G 优先
-    QuandongS3Dev4GBoard() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, ML307_DTR_PIN, 0),
-        boot_button_(BOOT_BUTTON_GPIO) {
+    QuandongS3Dev4GBoard()
+        : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, ML307_DTR_PIN, 0),
+          boot_button_(BOOT_BUTTON_GPIO) {
         InitializeI2c();
         InitializeSpi();
         InitializeAudioPaEnable();
         // 触摸必须先于显示初始化：I2C 总线已就绪，且要把触摸设备注册进 LVGL
         InitializeFt6336Touch();
         InitializeIli9341Display();
+        InitializeUiServices();
         RegisterFt6336Indev();
         InitializeNetworkSwitchByTouch();
         InitializeButtons();
@@ -317,27 +430,30 @@ public:
         GetBacklight()->SetBrightness(100);
     }
 
+    // Application 只注册一个网络事件回调；这里包一层，在每次联网成功后
+    // 顺便尝试记录一次余额基准，再把事件原样转给 Application。
+    virtual void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        app_network_callback_ = std::move(callback);
+        DualNetworkBoard::SetNetworkEventCallback(
+            [this](NetworkEvent event, const std::string& data) {
+                if (event == NetworkEvent::Connected) {
+                    StartBalanceBaselineFetch();
+                }
+                if (app_network_callback_) {
+                    app_network_callback_(event, data);
+                }
+            });
+    }
+
     virtual AudioCodec* GetAudioCodec() override {
         static Es8311AudioCodec audio_codec(
-            codec_i2c_bus_,
-            I2C_NUM_0,
-            AUDIO_INPUT_SAMPLE_RATE,
-            AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK,
-            AUDIO_I2S_GPIO_BCLK,
-            AUDIO_I2S_GPIO_WS,
-            AUDIO_I2S_GPIO_DOUT,
-            AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN,
-            AUDIO_CODEC_ES8311_ADDR,
-            true,
-            true);
+            codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT,
+            AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, true, true);
         return &audio_codec;
     }
 
-    virtual Display* GetDisplay() override {
-        return display_;
-    }
+    virtual Display* GetDisplay() override { return display_; }
 
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
