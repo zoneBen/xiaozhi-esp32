@@ -480,7 +480,17 @@ void DeepSeekBalanceUi::ApplyUpdate(const Update& update) {
             std::string baseline_currency;
             if (deepseek::GetBaseline(baseline_total, baseline_currency) &&
                 baseline_currency == entry.currency) {
-                today_consumption_ = baseline_total - current_total;
+                if (current_total > baseline_total + 0.005) {
+                    // 余额变多说明发生了充值：立即把基准更新为当前总额并清零，
+                    // 今日消耗从这次充值之后重新计算。
+                    deepseek::SetBaselineNow(current_total, entry.currency);
+                    today_consumption_ = 0.0;
+                } else {
+                    today_consumption_ = baseline_total - current_total;
+                    if (today_consumption_ < 0.0) {
+                        today_consumption_ = 0.0;
+                    }
+                }
                 has_consumption_ = true;
                 consumption_currency_ = entry.currency;
             } else {

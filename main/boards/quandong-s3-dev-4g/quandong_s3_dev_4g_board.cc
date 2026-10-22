@@ -22,9 +22,19 @@
 #include <wifi_station.h>
 
 #include <atomic>
+#include <ctime>
 #include <memory>
 
 #define TAG "QuandongS3Dev4GBoard"
+
+namespace {
+// 2025-01-01 UTC；低于它的时间视为还没同步。
+constexpr int64_t kMinValidTimestamp = 1735689600;
+// 余额基准在 NVS 里的有效期。
+constexpr int64_t kBaselineMaxAgeSec = 8 * 3600;
+// 开机后台任务最多等系统时间同步这么久。
+constexpr int kBaselineTimeWaitSeconds = 30;
+}  // namespace
 
 // ILI9341 厂家自定义初始化序列
 static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
@@ -66,6 +76,7 @@ private:
     std::unique_ptr<Ft6336Touch> touch_;  // 触摸屏不存在时保持 nullptr
     NetworkEventCallback app_network_callback_;
     std::atomic<bool> baseline_fetch_running_{false};
+    std::atomic<bool> baseline_boot_checked_{false};
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -254,12 +265,12 @@ private:
             });
     }
 
-    // 开机/重连后各尝试一次，把“今日消耗”的基准总额写进 RAM。
-    // 已有基准或没有 Token 时直接返回；后台任务自己拿锁串行化 HTTP 请求。
+    // 开机第一次联网时处理一次基准；运行中（包括断线重连）不更新已有基准。
+    // 没有基准时会重试，避免首次请求失败后整个开机周期都没有基准。
     void StartBalanceBaselineFetch() {
-        double total = 0.0;
-        std::string currency;
-        if (deepseek::GetBaseline(total, currency)) {
+        deepseek::BaselineInfo info;
+        const bool has_baseline = deepseek::GetBaselineInfo(info);
+        if (has_baseline && baseline_boot_checked_.load()) {
             return;
         }
         if (deepseek::LoadToken().empty()) {
@@ -272,18 +283,58 @@ private:
         if (xTaskCreate(BaselineTaskEntry, "ds_baseline", 8192, this, 2, nullptr) != pdPASS) {
             baseline_fetch_running_.store(false);
             ESP_LOGW(TAG, "创建余额基准任务失败");
+            return;
         }
+        baseline_boot_checked_.store(true);
+    }
+
+    static int64_t WaitForValidTime() {
+        for (int i = 0; i < kBaselineTimeWaitSeconds; ++i) {
+            const int64_t now = static_cast<int64_t>(std::time(nullptr));
+            if (now >= kMinValidTimestamp) {
+                return now;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        return now >= kMinValidTimestamp ? now : 0;
     }
 
     void RunBalanceBaselineFetch() {
+        // 网络刚连上时系统时间可能还没从服务端同步，先等一会儿再判断 8 小时有效期。
+        const int64_t now = WaitForValidTime();
         const std::string token = deepseek::LoadToken();
-        if (!token.empty()) {
-            std::string error;
-            if (deepseek::FetchAndStoreBaseline(token, error)) {
-                ESP_LOGI(TAG, "余额基准后台获取完成");
-            } else {
-                ESP_LOGW(TAG, "余额基准后台获取失败: %s", error.c_str());
-            }
+        deepseek::BaselineInfo info;
+        const bool has_baseline = deepseek::GetBaselineInfo(info);
+        const bool time_valid = now >= kMinValidTimestamp;
+
+        if (has_baseline && time_valid && info.timestamp > 0 &&
+            now - info.timestamp <= kBaselineMaxAgeSec) {
+            ESP_LOGI(TAG, "沿用 NVS 余额基准: %.2f %s, %lld 秒前", info.total,
+                     info.currency.c_str(), static_cast<long long>(now - info.timestamp));
+            baseline_fetch_running_.store(false);
+            return;
+        }
+        if (has_baseline && !time_valid) {
+            ESP_LOGW(TAG, "系统时间未同步，沿用 NVS 余额基准");
+            baseline_fetch_running_.store(false);
+            return;
+        }
+        if (token.empty()) {
+            baseline_fetch_running_.store(false);
+            return;
+        }
+
+        if (has_baseline) {
+            ESP_LOGI(TAG, "NVS 余额基准超过 8 小时，重新获取");
+        } else {
+            ESP_LOGI(TAG, "首次获取余额基准");
+        }
+        std::string error;
+        if (deepseek::FetchAndStoreBaseline(token, now, error, true)) {
+            ESP_LOGI(TAG, "余额基准已更新");
+        } else {
+            ESP_LOGW(TAG, "余额基准获取失败: %s", error.c_str());
         }
         baseline_fetch_running_.store(false);
     }
@@ -321,6 +372,7 @@ private:
             .on_token_changed =
                 [this]() {
                     deepseek::ResetBaseline();
+                    baseline_boot_checked_.store(false);
                     StartBalanceBaselineFetch();
                 },
         });

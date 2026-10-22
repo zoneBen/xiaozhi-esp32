@@ -1,6 +1,7 @@
 #ifndef QUANDONG_S3_DEV_4G_DEEPSEEK_CLIENT_H_
 #define QUANDONG_S3_DEV_4G_DEEPSEEK_CLIENT_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -39,14 +40,25 @@ bool FetchBalance(const std::string& token, BalanceInfo& info, std::string& erro
 // 解析接口返回的金额字符串（如 "110.00"）。
 bool ParseAmount(const std::string& text, double& value);
 
-// 今日消耗的基准总额。只存在 RAM 里，重启后清空。
-// 开机网络就绪后由后台任务写入一次；余额页首次成功请求作为兜底。
+// 今日消耗的基准总额，连同写入时的 Unix 时间戳一起持久化到 NVS。
+// 开机后台任务根据 8 小时有效期决定沿用还是重新获取；运行中不更新。
+struct BaselineInfo {
+    double total = 0.0;
+    std::string currency;
+    int64_t timestamp = 0;
+};
+
+bool GetBaselineInfo(BaselineInfo& info);
 bool GetBaseline(double& total, std::string& currency);
 void SetBaselineIfUnset(double total, const std::string& currency);
+void SetBaseline(double total, const std::string& currency, int64_t timestamp);
+// 检测到充值（余额变多）时，用当前总额覆盖基准并刷新时间戳。
+void SetBaselineNow(double total, const std::string& currency);
 void ResetBaseline();
 
-// 请求一次余额并把总余额写入基准（已有基准时不会覆盖）。
-bool FetchAndStoreBaseline(const std::string& token, std::string& error);
+// 请求一次余额并把总余额写入基准。overwrite=false 时仅在无基准时写入。
+bool FetchAndStoreBaseline(const std::string& token, int64_t timestamp, std::string& error,
+                           bool overwrite);
 
 }  // namespace deepseek
 
