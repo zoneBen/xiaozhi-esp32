@@ -10,9 +10,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
-#include <ctime>
 #include <mutex>
 
 #define TAG "DeepSeek"
@@ -27,10 +25,6 @@ constexpr int kHttpTimeoutMs = 15000;
 constexpr size_t kMaxTokenLength = 128;
 constexpr const char* kTokenNamespace = "deepseek";
 constexpr const char* kTokenKey = "token";
-// NVS key 最长 15 字符，这里都用短名。
-constexpr const char* kBaselineTotalKey = "base_total";
-constexpr const char* kBaselineCurrencyKey = "base_cur";
-constexpr const char* kBaselineTimeKey = "base_time";
 
 std::string Trim(const std::string& value) {
     size_t begin = 0;
@@ -82,66 +76,8 @@ std::string GetStringField(const cJSON* object, const char* key) {
     return item->valuestring;
 }
 
-// 今日消耗基准：RAM 缓存 + NVS 持久化（总额、币种、写入时间戳）。
-std::mutex g_baseline_mutex;
-bool g_has_baseline = false;
-bool g_baseline_loaded = false;
-double g_baseline_total = 0.0;
-std::string g_baseline_currency;
-int64_t g_baseline_timestamp = 0;
-
-// 后台开机请求和余额页可能同时发起请求，串行化避免抢同一个 HTTP 连接号。
+// 后台记录任务和余额页可能同时发起请求，串行化避免抢同一个 HTTP 连接号。
 std::mutex g_fetch_mutex;
-
-int64_t NowTimestamp() { return static_cast<int64_t>(std::time(nullptr)); }
-
-int64_t ParseTimestamp(const std::string& text) {
-    if (text.empty()) {
-        return 0;
-    }
-    errno = 0;
-    char* end = nullptr;
-    const long long value = std::strtoll(text.c_str(), &end, 10);
-    if (end == text.c_str() || *end != '\0' || errno == ERANGE || value < 0) {
-        return 0;
-    }
-    return static_cast<int64_t>(value);
-}
-
-// 以下 *Locked 函数要求调用方已持有 g_baseline_mutex。
-void LoadBaselineLocked() {
-    g_baseline_loaded = true;
-    g_has_baseline = false;
-    g_baseline_total = 0.0;
-    g_baseline_currency.clear();
-    g_baseline_timestamp = 0;
-
-    Settings settings(kTokenNamespace, false);
-    const std::string total_text = settings.GetString(kBaselineTotalKey);
-    if (total_text.empty() || !ParseAmount(total_text, g_baseline_total)) {
-        return;
-    }
-    g_baseline_currency = settings.GetString(kBaselineCurrencyKey);
-    g_baseline_timestamp = ParseTimestamp(settings.GetString(kBaselineTimeKey));
-    g_has_baseline = true;
-}
-
-void SaveBaselineLocked(double total, const std::string& currency, int64_t timestamp) {
-    g_has_baseline = true;
-    g_baseline_loaded = true;
-    g_baseline_total = total;
-    g_baseline_currency = currency;
-    g_baseline_timestamp = timestamp;
-
-    char total_text[32];
-    std::snprintf(total_text, sizeof(total_text), "%.2f", total);
-    Settings settings(kTokenNamespace, true);
-    settings.SetString(kBaselineTotalKey, total_text);
-    settings.SetString(kBaselineCurrencyKey, currency);
-    settings.SetString(kBaselineTimeKey, std::to_string(timestamp));
-    ESP_LOGI(TAG, "余额基准写入 NVS: %.2f %s @ %lld", total, currency.c_str(),
-             static_cast<long long>(timestamp));
-}
 
 }  // namespace
 
@@ -157,66 +93,6 @@ bool ParseAmount(const std::string& text, double& value) {
     }
     value = parsed;
     return true;
-}
-
-bool GetBaselineInfo(BaselineInfo& info) {
-    std::lock_guard<std::mutex> lock(g_baseline_mutex);
-    if (!g_baseline_loaded) {
-        LoadBaselineLocked();
-    }
-    if (!g_has_baseline) {
-        return false;
-    }
-    info.total = g_baseline_total;
-    info.currency = g_baseline_currency;
-    info.timestamp = g_baseline_timestamp;
-    return true;
-}
-
-bool GetBaseline(double& total, std::string& currency) {
-    BaselineInfo info;
-    if (!GetBaselineInfo(info)) {
-        return false;
-    }
-    total = info.total;
-    currency = info.currency;
-    return true;
-}
-
-void SetBaselineIfUnset(double total, const std::string& currency) {
-    std::lock_guard<std::mutex> lock(g_baseline_mutex);
-    if (!g_baseline_loaded) {
-        LoadBaselineLocked();
-    }
-    if (g_has_baseline) {
-        return;
-    }
-    SaveBaselineLocked(total, currency, NowTimestamp());
-}
-
-void SetBaseline(double total, const std::string& currency, int64_t timestamp) {
-    std::lock_guard<std::mutex> lock(g_baseline_mutex);
-    SaveBaselineLocked(total, currency, timestamp);
-}
-
-void SetBaselineNow(double total, const std::string& currency) {
-    std::lock_guard<std::mutex> lock(g_baseline_mutex);
-    SaveBaselineLocked(total, currency, NowTimestamp());
-}
-
-void ResetBaseline() {
-    std::lock_guard<std::mutex> lock(g_baseline_mutex);
-    g_has_baseline = false;
-    g_baseline_loaded = true;
-    g_baseline_total = 0.0;
-    g_baseline_currency.clear();
-    g_baseline_timestamp = 0;
-
-    Settings settings(kTokenNamespace, true);
-    settings.SetString(kBaselineTotalKey, "");
-    settings.SetString(kBaselineCurrencyKey, "");
-    settings.SetString(kBaselineTimeKey, "");
-    ESP_LOGI(TAG, "余额基准已清除");
 }
 
 std::string LoadToken() {
@@ -350,30 +226,6 @@ bool FetchBalance(const std::string& token, BalanceInfo& info, std::string& erro
 
     ESP_LOGI(TAG, "余额查询成功: available=%d, entries=%u", info.is_available,
              static_cast<unsigned>(info.entries.size()));
-    return true;
-}
-
-bool FetchAndStoreBaseline(const std::string& token, int64_t timestamp, std::string& error,
-                           bool overwrite) {
-    BalanceInfo info;
-    if (!FetchBalance(token, info, error)) {
-        return false;
-    }
-    if (info.entries.empty()) {
-        error = "未返回余额信息";
-        return false;
-    }
-    const BalanceEntry& entry = info.entries.front();
-    double total = 0.0;
-    if (!ParseAmount(entry.total_balance, total)) {
-        error = "总余额格式错误";
-        return false;
-    }
-    if (overwrite) {
-        SetBaseline(total, entry.currency, timestamp);
-    } else {
-        SetBaselineIfUnset(total, entry.currency);
-    }
     return true;
 }
 

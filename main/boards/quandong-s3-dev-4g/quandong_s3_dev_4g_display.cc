@@ -8,6 +8,8 @@
 #include <esp_timer.h>
 #include <material_symbols.h>
 
+#include <algorithm>
+
 #define TAG "QuandongS3Dev4GDisplay"
 
 namespace {
@@ -78,6 +80,7 @@ QuandongS3Dev4GDisplay::QuandongS3Dev4GDisplay(esp_lcd_panel_io_handle_t panel_i
 QuandongS3Dev4GDisplay::~QuandongS3Dev4GDisplay() {
     // 覆盖页先收：余额页析构会等正在进行的 HTTP 请求退出，
     // 必须赶在 LVGL 端口被基类拆掉之前完成。
+    bill_ui_.reset();
     balance_ui_.reset();
     settings_ui_.reset();
 
@@ -86,9 +89,9 @@ QuandongS3Dev4GDisplay::~QuandongS3Dev4GDisplay() {
 #endif
     {
         DisplayLockGuard lock(this);
-        if (settings_tap_area_ != nullptr) {
-            lv_obj_delete(settings_tap_area_);
-            settings_tap_area_ = nullptr;
+        if (top_bar_actions_tap_area_ != nullptr) {
+            lv_obj_delete(top_bar_actions_tap_area_);
+            top_bar_actions_tap_area_ = nullptr;
         }
         // 弹窗挂在 lv_layer_top() 上，不在基类析构负责的 label 之列，这里自己收掉
         if (dialog_ != nullptr) {
@@ -109,6 +112,7 @@ void QuandongS3Dev4GDisplay::SetupUI() {
         return;
     }
     CreateNetworkTapArea();
+    CreateBillButton();
     CreateSettingsButton();
 #if LV_USE_VECTOR_GRAPHIC
     CreateCatFace();
@@ -213,6 +217,49 @@ void QuandongS3Dev4GDisplay::SetUiServices(UiServices services) {
     ui_services_ = std::move(services);
 }
 
+void QuandongS3Dev4GDisplay::CreateBillButton() {
+    if (bill_button_ != nullptr || top_bar_ == nullptr) {
+        return;
+    }
+
+    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    if (lvgl_theme == nullptr || lvgl_theme->icon_font() == nullptr) {
+        ESP_LOGE(TAG, "主题未就绪，账单按钮未创建");
+        return;
+    }
+
+    lv_obj_t* right_icons = lv_obj_get_child(top_bar_, 1);
+    if (right_icons == nullptr) {
+        right_icons = top_bar_;
+    }
+
+    // 先建账单，再建设置：两者共用右上角 flex 行，账单显示在齿轮左侧。
+    bill_button_ = lv_button_create(right_icons);
+    lv_obj_set_size(bill_button_, 24, 24);
+    lv_obj_set_style_radius(bill_button_, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(bill_button_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bill_button_, 0, 0);
+    lv_obj_set_style_shadow_width(bill_button_, 0, 0);
+    lv_obj_set_style_pad_all(bill_button_, 0, 0);
+    lv_obj_set_style_margin_left(bill_button_, 2, 0);
+    lv_obj_set_style_bg_color(bill_button_, lvgl_theme->text_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(bill_button_, LV_OPA_20, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(bill_button_, OnBillButtonClicked, LV_EVENT_CLICKED, this);
+
+    bill_icon_ = lv_label_create(bill_button_);
+    lv_label_set_text(bill_icon_, MATERIAL_SYMBOLS_CALENDAR_MONTH);
+    const lv_font_t* icon_font = lvgl_theme->icon_font()->font();
+    if (lvgl_theme->text_font() != nullptr && lvgl_theme->text_font()->font() != nullptr &&
+        lvgl_theme->text_font()->font()->line_height >= 40) {
+        icon_font = lvgl_theme->large_icon_font()->font();
+    }
+    lv_obj_set_style_text_font(bill_icon_, icon_font, 0);
+    lv_obj_set_style_text_color(bill_icon_, lvgl_theme->text_color(), 0);
+    lv_obj_center(bill_icon_);
+    lv_obj_move_foreground(bill_button_);
+    ESP_LOGI(TAG, "账单按钮已创建");
+}
+
 void QuandongS3Dev4GDisplay::CreateSettingsButton() {
     if (settings_button_ != nullptr || top_bar_ == nullptr) {
         return;
@@ -255,22 +302,50 @@ void QuandongS3Dev4GDisplay::CreateSettingsButton() {
     lv_obj_center(settings_icon_);
     lv_obj_move_foreground(settings_button_);
 
-    // status_bar_ 在 top_bar_ 之后创建且默认 CLICKABLE，会盖住齿轮；
-    // 和左上角网络图标一样，用一块贴在屏幕右上角的透明热区接管触摸。
-    settings_tap_area_ = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(settings_tap_area_, 40, 40);
-    lv_obj_align(settings_tap_area_, LV_ALIGN_TOP_RIGHT, 0, 0);
-    lv_obj_set_style_bg_opa(settings_tap_area_, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(settings_tap_area_, 0, 0);
-    lv_obj_set_style_radius(settings_tap_area_, 0, 0);
-    lv_obj_set_style_pad_all(settings_tap_area_, 0, 0);
-    lv_obj_set_style_shadow_width(settings_tap_area_, 0, 0);
-    lv_obj_set_scrollbar_mode(settings_tap_area_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(settings_tap_area_, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(settings_tap_area_, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(settings_tap_area_, OnSettingsButtonClicked, LV_EVENT_CLICKED, this);
-    lv_obj_move_foreground(settings_tap_area_);
+    CreateTopBarActionsTapArea();
     ESP_LOGI(TAG, "设置按钮已创建");
+}
+
+void QuandongS3Dev4GDisplay::CreateTopBarActionsTapArea() {
+    if (top_bar_actions_tap_area_ != nullptr || settings_button_ == nullptr) {
+        return;
+    }
+
+    // status_bar_ 在 top_bar_ 之后创建且默认 CLICKABLE，会盖住两个图标。
+    // 用一块透明热区同时接管账单和设置：范围按两个按钮的真实坐标算，
+    // 这样主题间距 / 电池图标宽度变化时也不会点错。
+    lv_obj_update_layout(top_bar_);
+    lv_area_t bill_area = {};
+    lv_area_t settings_area = {};
+    lv_obj_get_coords(settings_button_, &settings_area);
+    int left = static_cast<int>(settings_area.x1) - 4;
+    if (bill_button_ != nullptr) {
+        lv_obj_get_coords(bill_button_, &bill_area);
+        left = std::min(static_cast<int>(bill_area.x1), left);
+    }
+    int right =
+        std::max(static_cast<int>(settings_area.x2), static_cast<int>(bill_area.x2)) + 4;
+    left = std::max(left, 0);
+    right = std::min(right, static_cast<int>(LV_HOR_RES) - 1);
+    if (right <= left) {
+        return;
+    }
+
+    top_bar_actions_tap_area_ = lv_obj_create(lv_screen_active());
+    lv_obj_set_pos(top_bar_actions_tap_area_, left, 0);
+    lv_obj_set_size(top_bar_actions_tap_area_, right - left + 1, 40);
+    lv_obj_set_style_bg_opa(top_bar_actions_tap_area_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(top_bar_actions_tap_area_, 0, 0);
+    lv_obj_set_style_radius(top_bar_actions_tap_area_, 0, 0);
+    lv_obj_set_style_pad_all(top_bar_actions_tap_area_, 0, 0);
+    lv_obj_set_style_shadow_width(top_bar_actions_tap_area_, 0, 0);
+    lv_obj_set_scrollbar_mode(top_bar_actions_tap_area_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(top_bar_actions_tap_area_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(top_bar_actions_tap_area_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(top_bar_actions_tap_area_, OnTopBarActionsClicked, LV_EVENT_CLICKED,
+                        this);
+    lv_obj_move_foreground(top_bar_actions_tap_area_);
+    ESP_LOGI(TAG, "右上角账单/设置热区已创建 (%d..%d)", left, right);
 }
 
 void QuandongS3Dev4GDisplay::SetTheme(Theme* theme) {
@@ -294,14 +369,29 @@ void QuandongS3Dev4GDisplay::SetTheme(Theme* theme) {
         lv_obj_set_style_text_font(settings_icon_, icon_font, 0);
         lv_obj_set_style_text_color(settings_icon_, lvgl_theme->text_color(), 0);
     }
+    if (bill_icon_ != nullptr && lvgl_theme->icon_font() != nullptr) {
+        const lv_font_t* icon_font = lvgl_theme->icon_font()->font();
+        if (lvgl_theme->text_font() != nullptr && lvgl_theme->text_font()->font() != nullptr &&
+            lvgl_theme->text_font()->font()->line_height >= 40) {
+            icon_font = lvgl_theme->large_icon_font()->font();
+        }
+        lv_obj_set_style_text_font(bill_icon_, icon_font, 0);
+        lv_obj_set_style_text_color(bill_icon_, lvgl_theme->text_color(), 0);
+    }
     if (settings_button_ != nullptr) {
         lv_obj_set_style_bg_color(settings_button_, lvgl_theme->text_color(), LV_STATE_PRESSED);
+    }
+    if (bill_button_ != nullptr) {
+        lv_obj_set_style_bg_color(bill_button_, lvgl_theme->text_color(), LV_STATE_PRESSED);
     }
     if (settings_ui_ != nullptr) {
         settings_ui_->RefreshTheme();
     }
     if (balance_ui_ != nullptr) {
         balance_ui_->RefreshTheme();
+    }
+    if (bill_ui_ != nullptr) {
+        bill_ui_->RefreshTheme();
     }
 }
 
@@ -319,6 +409,9 @@ void QuandongS3Dev4GDisplay::ShowSettingsPageLocked() {
     CloseConfirmDialog();
     if (balance_ui_ != nullptr) {
         balance_ui_->Hide();
+    }
+    if (bill_ui_ != nullptr) {
+        bill_ui_->Hide();
     }
     if (settings_ui_ == nullptr) {
         settings_ui_ = std::make_unique<CatSettingsUi>(this, MakeSettingsCallbacks());
@@ -344,10 +437,14 @@ void QuandongS3Dev4GDisplay::ShowBalancePage() {
 }
 
 void QuandongS3Dev4GDisplay::ShowBalancePageLocked() {
+    bill_returns_to_balance_ = false;
     SetOverlayActiveLocked(true);
     CloseConfirmDialog();
     if (settings_ui_ != nullptr) {
         settings_ui_->Hide();
+    }
+    if (bill_ui_ != nullptr) {
+        bill_ui_->Hide();
     }
     if (balance_ui_ == nullptr) {
         balance_ui_ = std::make_unique<DeepSeekBalanceUi>(this, MakeBalanceCallbacks());
@@ -359,6 +456,41 @@ void QuandongS3Dev4GDisplay::ShowBalancePageLocked() {
 void QuandongS3Dev4GDisplay::HideBalancePageLocked() {
     if (balance_ui_ != nullptr) {
         balance_ui_->Hide();
+    }
+    SetOverlayActiveLocked(false);
+}
+
+void QuandongS3Dev4GDisplay::ShowBillPageLocked(bool return_to_balance) {
+    // 这个页面由“今日消耗”页进入，返回时回到今日消耗页，形成
+    // 猫脸 -> 今日消耗 -> 余额/消耗折线 -> 今日消耗 的闭环。
+    bill_returns_to_balance_ = return_to_balance;
+    SetOverlayActiveLocked(true);
+    CloseConfirmDialog();
+    if (settings_ui_ != nullptr) {
+        settings_ui_->Hide();
+    }
+    if (balance_ui_ != nullptr) {
+        balance_ui_->Hide();
+    }
+    if (bill_ui_ == nullptr) {
+        bill_ui_ = std::make_unique<DeepSeekBillUi>(this, MakeBillCallbacks());
+    }
+    bill_ui_->Show();
+    SetOverlayActiveLocked(true);
+}
+
+void QuandongS3Dev4GDisplay::HideBillPageLocked() {
+    if (bill_ui_ != nullptr) {
+        bill_ui_->Hide();
+    }
+    if (bill_returns_to_balance_) {
+        bill_returns_to_balance_ = false;
+        if (balance_ui_ != nullptr) {
+            // 回到今日消耗页；Show() 会恢复余额轮询并刷新一次。
+            balance_ui_->Show();
+            SetOverlayActiveLocked(true);
+            return;
+        }
     }
     SetOverlayActiveLocked(false);
 }
@@ -399,7 +531,16 @@ CatSettingsUi::Callbacks QuandongS3Dev4GDisplay::MakeSettingsCallbacks() {
             clear_provisioning();
         }
     };
-    callbacks.on_token_changed = ui_services_.on_token_changed;
+    auto on_token_changed = ui_services_.on_token_changed;
+    callbacks.on_token_changed = [this, on_token_changed]() {
+        // 旧 Token 对应的余额/今日消耗立刻作废，避免新 Token 请求失败时还显示旧账号数据。
+        if (balance_ui_ != nullptr) {
+            balance_ui_->ResetForTokenChange();
+        }
+        if (on_token_changed) {
+            on_token_changed();
+        }
+    };
     return callbacks;
 }
 
@@ -434,7 +575,55 @@ DeepSeekBalanceUi::Callbacks QuandongS3Dev4GDisplay::MakeBalanceCallbacks() {
         settings_ui_->ShowTokenPage();
         SetOverlayActiveLocked(true);
     };
+    callbacks.on_open_bill = [this]() {
+        // 由今日消耗页的主卡/三栏点击调起，LVGL 锁已经在手。
+        ShowBillPageLocked(true);
+    };
     return callbacks;
+}
+
+DeepSeekBillUi::Callbacks QuandongS3Dev4GDisplay::MakeBillCallbacks() {
+    DeepSeekBillUi::Callbacks callbacks;
+    callbacks.on_close = [this]() {
+        DisplayLockGuard lock(this);
+        if (lock) {
+            HideBillPageLocked();
+        }
+    };
+    return callbacks;
+}
+
+void QuandongS3Dev4GDisplay::OnBillButtonClicked(lv_event_t* event) {
+    auto* self = static_cast<QuandongS3Dev4GDisplay*>(lv_event_get_user_data(event));
+    if (self != nullptr) {
+        // 账单按钮现在作为“今日消耗/余额页”的直接入口；
+        // 折线账单页从今日消耗页的卡面进入。
+        self->ShowBalancePage();
+    }
+}
+
+void QuandongS3Dev4GDisplay::OnTopBarActionsClicked(lv_event_t* event) {
+    auto* self = static_cast<QuandongS3Dev4GDisplay*>(lv_event_get_user_data(event));
+    if (self == nullptr || self->settings_button_ == nullptr) {
+        return;
+    }
+
+    lv_indev_t* indev = lv_indev_active();
+    if (indev == nullptr) {
+        return;
+    }
+    lv_point_t point = {};
+    lv_indev_get_point(indev, &point);
+
+    lv_area_t settings_area = {};
+    lv_obj_get_coords(self->settings_button_, &settings_area);
+    // 左边是账单（今日消耗入口），右边是设置。两个按钮都在热区内部，
+    // 按齿轮左边界分界。
+    if (self->bill_button_ != nullptr && point.x < settings_area.x1) {
+        self->ShowBalancePage();
+    } else {
+        self->ShowSettingsPage();
+    }
 }
 
 void QuandongS3Dev4GDisplay::OnSettingsButtonClicked(lv_event_t* event) {

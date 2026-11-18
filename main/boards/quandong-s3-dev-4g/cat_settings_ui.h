@@ -14,7 +14,7 @@ public:
     struct Callbacks {
         std::function<void()> on_close;               // 返回猫脸
         std::function<void()> on_clear_provisioning;  // 清 SSID + 切回 WiFi + 重启
-        std::function<void()> on_token_changed;       // 重置余额基准并尝试后台取一次
+        std::function<void()> on_token_changed;       // 清空账单历史并立即后台采样一次
         // 复用主界面已有的模态确认框（message, on_confirm）
         std::function<void(const char*, std::function<void()>)> show_confirm;
     };

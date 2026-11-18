@@ -22,6 +22,7 @@ public:
             fetch;
         std::function<void()> on_close;          // 返回猫脸
         std::function<void()> on_open_settings;  // Token 未配置时的“去设置”
+        std::function<void()> on_open_bill;      // 进入余额/消耗折线账单页
     };
 
     DeepSeekBalanceUi(Display* display, Callbacks callbacks);
@@ -34,6 +35,9 @@ public:
     void Hide();
     bool IsVisible() const;
     void RefreshTheme();
+
+    // 设置页保存/清除 Token 后调用：旧账号的余额和今日消耗不能继续显示。
+    void ResetForTokenChange();
 
 private:
     enum class State { kIdle, kLoading, kOk, kError };
@@ -71,6 +75,7 @@ private:
     static void OnBackClicked(lv_event_t* event);
     static void OnRefreshClicked(lv_event_t* event);
     static void OnSettingsLinkClicked(lv_event_t* event);
+    static void OnOpenBillClicked(lv_event_t* event);
 
     static std::string FormatAge(int64_t age_us);
 
@@ -90,10 +95,12 @@ private:
     lv_obj_t* amount_ = nullptr;
     lv_obj_t* currency_ = nullptr;
     lv_obj_t* amount_row_ = nullptr;
+    lv_obj_t* hero_arrow_ = nullptr;
 
     lv_obj_t* granted_value_ = nullptr;
     lv_obj_t* topped_value_ = nullptr;
     lv_obj_t* total_value_ = nullptr;
+    lv_obj_t* total_arrow_ = nullptr;
 
     lv_obj_t* footer_ = nullptr;
     lv_obj_t* settings_link_ = nullptr;
@@ -116,8 +123,8 @@ private:
     int64_t last_success_us_ = 0;
     std::string last_age_text_;
 
-    // “今日消耗”的基准由 deepseek_client 的进程级存储维护，
-    // 开机后台请求先写入；余额页首次成功请求作为兜底。
+    // “今日消耗”的基准由 balance_history 维护：当天第一次成功取到的
+    // 总额 / 赠送额，按本地日期持久化。
     bool has_consumption_ = false;
     double today_consumption_ = 0.0;
     std::string consumption_currency_;

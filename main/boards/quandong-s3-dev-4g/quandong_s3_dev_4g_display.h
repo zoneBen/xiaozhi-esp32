@@ -5,6 +5,7 @@
 #include "cat_face_lvgl.h"
 #include "cat_settings_ui.h"
 #include "deepseek_balance_ui.h"
+#include "deepseek_bill_ui.h"
 #include "deepseek_client.h"
 
 #include "display/lcd_display.h"
@@ -63,10 +64,14 @@ private:
     static void OnTapAreaClicked(lv_event_t* event);
     static void OnConfirmClicked(lv_event_t* event);
     static void OnCancelClicked(lv_event_t* event);
+    static void OnBillButtonClicked(lv_event_t* event);
     static void OnSettingsButtonClicked(lv_event_t* event);
+    static void OnTopBarActionsClicked(lv_event_t* event);
 
     void CreateNetworkTapArea();
+    void CreateBillButton();
     void CreateSettingsButton();
+    void CreateTopBarActionsTapArea();
     void CloseConfirmDialog();
 
     void ShowSettingsPage();
@@ -74,9 +79,12 @@ private:
     void HideSettingsPageLocked();
     void ShowBalancePageLocked();
     void HideBalancePageLocked();
+    void ShowBillPageLocked(bool return_to_balance);
+    void HideBillPageLocked();
     void SetOverlayActiveLocked(bool active);
     CatSettingsUi::Callbacks MakeSettingsCallbacks();
     DeepSeekBalanceUi::Callbacks MakeBalanceCallbacks();
+    DeepSeekBillUi::Callbacks MakeBillCallbacks();
 
 #if LV_USE_VECTOR_GRAPHIC
     void CreateCatFace();
@@ -87,13 +95,17 @@ private:
 
     lv_obj_t* tap_area_ = nullptr;  // 左上角网络图标的透明触摸热区
     lv_obj_t* dialog_ = nullptr;    // 非空表示确认框已打开
+    lv_obj_t* bill_button_ = nullptr;
+    lv_obj_t* bill_icon_ = nullptr;
     lv_obj_t* settings_button_ = nullptr;
     lv_obj_t* settings_icon_ = nullptr;
-    lv_obj_t* settings_tap_area_ = nullptr;
+    lv_obj_t* top_bar_actions_tap_area_ = nullptr;
     std::unique_ptr<CatSettingsUi> settings_ui_;
     std::unique_ptr<DeepSeekBalanceUi> balance_ui_;
+    std::unique_ptr<DeepSeekBillUi> bill_ui_;
     UiServices ui_services_;
     bool overlay_active_ = false;
+    bool bill_returns_to_balance_ = false;
     std::function<void()> on_network_icon_tapped_;
     std::function<void()> on_confirm_;
 

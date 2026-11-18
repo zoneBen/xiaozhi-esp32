@@ -1,5 +1,7 @@
 #include "deepseek_balance_ui.h"
 
+#include "balance_history.h"
+
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -8,12 +10,14 @@
 
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <utility>
 
 #define TAG "DeepSeekBalanceUi"
 
 LV_FONT_DECLARE(font_noto_sans_basic_14_1);
 LV_FONT_DECLARE(font_noto_sans_basic_30_4);
+LV_FONT_DECLARE(font_material_symbols_14_1);
 
 namespace {
 
@@ -43,8 +47,8 @@ std::string Money(const std::string& amount, const std::string& currency) {
     return CurrencySymbol(currency) + amount;
 }
 
-// 今日消耗 = 开机后第一次成功取到的总额 - 当前总额。
-// 正数是消耗，负数说明期间充值/赠金导致余额变多。
+// 今日消耗 = 当天第一次成功取到的总额 - 当前总额。
+// 充值会重置当天基准，正常只会是非负数；保留符号格式化以兼容异常数据。
 std::string SignedMoney(double value, const std::string& currency) {
     char number[32];
     std::snprintf(number, sizeof(number), "%.2f", std::fabs(value));
@@ -176,6 +180,9 @@ void DeepSeekBalanceUi::BuildHero() {
     lv_obj_set_style_shadow_color(hero_, lv_color_hex(0x1D3BFF), 0);
     lv_obj_set_scrollbar_mode(hero_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(hero_, LV_OBJ_FLAG_SCROLLABLE);
+    // 整张主卡可点，进入余额/消耗折线账单页。
+    lv_obj_add_flag(hero_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(hero_, OnOpenBillClicked, LV_EVENT_CLICKED, this);
 
     // 右侧两枚半透明圆：被圆角卡片裁切后形成弧线，给纯色卡面一点层次。
     lv_obj_t* ring = lv_obj_create(hero_);
@@ -186,6 +193,7 @@ void DeepSeekBalanceUi::BuildHero() {
     lv_obj_set_style_border_width(ring, 0, 0);
     lv_obj_set_style_shadow_width(ring, 0, 0);
     lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_align(ring, LV_ALIGN_RIGHT_MID, 42, -8);
 
     lv_obj_t* small_ring = lv_obj_create(hero_);
@@ -196,6 +204,7 @@ void DeepSeekBalanceUi::BuildHero() {
     lv_obj_set_style_border_width(small_ring, 0, 0);
     lv_obj_set_style_shadow_width(small_ring, 0, 0);
     lv_obj_clear_flag(small_ring, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(small_ring, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_align(small_ring, LV_ALIGN_RIGHT_MID, 18, 38);
 
     caption_ = lv_label_create(hero_);
@@ -220,6 +229,7 @@ void DeepSeekBalanceUi::BuildHero() {
     lv_obj_set_flex_align(status_pill_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(status_pill_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(status_pill_, LV_OBJ_FLAG_CLICKABLE);
 
     status_icon_ = lv_label_create(status_pill_);
     lv_label_set_text(status_icon_, MATERIAL_SYMBOLS_PROGRESS_ACTIVITY);
@@ -241,6 +251,7 @@ void DeepSeekBalanceUi::BuildHero() {
     lv_obj_set_flex_flow(amount_row_, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(amount_row_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
     lv_obj_clear_flag(amount_row_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(amount_row_, LV_OBJ_FLAG_CLICKABLE);
 
     amount_ = lv_label_create(amount_row_);
     lv_label_set_text(amount_, "--");
@@ -255,6 +266,13 @@ void DeepSeekBalanceUi::BuildHero() {
     lv_obj_set_style_text_font(currency_, &font_noto_sans_basic_14_1, 0);
     lv_obj_set_style_text_color(currency_, lv_color_hex(0xDCE5FF), 0);
     lv_obj_set_style_pad_bottom(currency_, 3, 0);
+
+    // 主卡整块可点，右侧小箭头给出可进入账单页的提示。
+    hero_arrow_ = lv_label_create(amount_row_);
+    lv_label_set_text(hero_arrow_, MATERIAL_SYMBOLS_ARROW_FORWARD);
+    lv_obj_set_style_text_font(hero_arrow_, &font_material_symbols_14_1, 0);
+    lv_obj_set_style_text_color(hero_arrow_, lv_color_hex(0xDCE5FF), 0);
+    lv_obj_set_style_pad_bottom(hero_arrow_, 4, 0);
 }
 
 void DeepSeekBalanceUi::BuildTiles() {
@@ -264,6 +282,9 @@ void DeepSeekBalanceUi::BuildTiles() {
         lv_obj_t* card = CreateCard(root_, kMargin + index * (tile_width + kTileGap), kTileY,
                                     tile_width, kTileHeight);
         cards_.push_back(card);
+        // 三栏都可点，统一进入余额/消耗账单页；总额栏额外加一个小箭头提示。
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, OnOpenBillClicked, LV_EVENT_CLICKED, this);
 
         lv_obj_t* title_label = lv_label_create(card);
         lv_label_set_text(title_label, title);
@@ -280,6 +301,13 @@ void DeepSeekBalanceUi::BuildTiles() {
         lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(value, LV_LABEL_LONG_MODE_DOTS);
         *value_out = value;
+
+        if (index == 2) {
+            total_arrow_ = lv_label_create(card);
+            lv_label_set_text(total_arrow_, MATERIAL_SYMBOLS_ARROW_FORWARD);
+            lv_obj_set_style_text_font(total_arrow_, &font_material_symbols_14_1, 0);
+            lv_obj_align(total_arrow_, LV_ALIGN_TOP_RIGHT, -6, 5);
+        }
     };
 
     create_stat(0, "赠送", &granted_value_);
@@ -346,6 +374,26 @@ void DeepSeekBalanceUi::Hide() {
 
 bool DeepSeekBalanceUi::IsVisible() const {
     return root_ != nullptr && !lv_obj_has_flag(root_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void DeepSeekBalanceUi::ResetForTokenChange() {
+    // 由设置页的 LVGL 事件回调直接调起，锁已经在手，不能再取 DisplayLockGuard。
+    {
+        std::lock_guard<std::mutex> lock(update_mutex_);
+        pending_ = {};
+        pending_.revision = applied_revision_ + 1;
+        applied_revision_ = pending_.revision;
+        has_pending_ = false;
+    }
+    has_data_ = false;
+    has_consumption_ = false;
+    today_consumption_ = 0.0;
+    consumption_currency_.clear();
+    last_success_us_ = 0;
+    last_age_text_.clear();
+    if (root_ != nullptr) {
+        ApplyIdleState();
+    }
 }
 
 void DeepSeekBalanceUi::RefreshTheme() {
@@ -422,6 +470,19 @@ void DeepSeekBalanceUi::ApplyPalette() {
     lv_obj_set_style_text_color(topped_value_, palette_.accent, 0);
     lv_obj_set_style_text_font(total_value_, &font_noto_sans_basic_14_1, 0);
     lv_obj_set_style_text_color(total_value_, palette_.text, 0);
+    if (hero_arrow_ != nullptr) {
+        lv_obj_set_style_text_font(hero_arrow_, &font_material_symbols_14_1, 0);
+        lv_obj_set_style_text_color(hero_arrow_, lv_color_hex(0xDCE5FF), 0);
+    }
+    if (total_arrow_ != nullptr) {
+        lv_obj_set_style_text_font(total_arrow_, &font_material_symbols_14_1, 0);
+        lv_obj_set_style_text_color(total_arrow_, palette_.accent, 0);
+    }
+    // 主卡可点进账单页：按下时把蓝色渐变整体压暗一点。
+    lv_obj_set_style_bg_color(hero_, lv_color_darken(lv_color_hex(0x1D3BFF), 12),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_bg_grad_color(hero_, lv_color_darken(lv_color_hex(0x5B7BFF), 12),
+                                   LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(settings_link_, palette_.accent, 0);
     lv_obj_set_style_bg_opa(settings_link_, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(settings_link_, lv_color_darken(palette_.accent, 20),
@@ -472,35 +533,13 @@ void DeepSeekBalanceUi::ApplyUpdate(const Update& update) {
         last_success_us_ = update.fetched_at_us;
         last_age_text_.clear();
 
-        // 基准正常由开机后台请求写入；如果后台还没成功，这里首次成功请求兜底。
-        double current_total = 0.0;
-        if (deepseek::ParseAmount(entry.total_balance, current_total)) {
-            deepseek::SetBaselineIfUnset(current_total, entry.currency);
-            double baseline_total = 0.0;
-            std::string baseline_currency;
-            if (deepseek::GetBaseline(baseline_total, baseline_currency) &&
-                baseline_currency == entry.currency) {
-                if (current_total > baseline_total + 0.005) {
-                    // 余额变多说明发生了充值：立即把基准更新为当前总额并清零，
-                    // 今日消耗从这次充值之后重新计算。
-                    deepseek::SetBaselineNow(current_total, entry.currency);
-                    today_consumption_ = 0.0;
-                } else {
-                    today_consumption_ = baseline_total - current_total;
-                    if (today_consumption_ < 0.0) {
-                        today_consumption_ = 0.0;
-                    }
-                }
-                has_consumption_ = true;
-                consumption_currency_ = entry.currency;
-            } else {
-                // 币种变了：基准切到当前币种，从 0 开始。
-                deepseek::ResetBaseline();
-                deepseek::SetBaselineIfUnset(current_total, entry.currency);
-                today_consumption_ = 0.0;
-                has_consumption_ = true;
-                consumption_currency_ = entry.currency;
-            }
+        // 每日基准由 balance_history 维护：当天第一次取到的总额 / 赠送额。
+        // 请求任务在发布结果前已经更新过记录，这里只读取 RAM 中的当天值。
+        balance_history::DailyRecord record;
+        if (balance_history::GetToday(record)) {
+            today_consumption_ = record.Consumption();
+            consumption_currency_ = record.currency.empty() ? entry.currency : record.currency;
+            has_consumption_ = true;
         } else {
             has_consumption_ = false;
         }
@@ -653,7 +692,20 @@ void DeepSeekBalanceUi::WorkerLoop() {
             }
             // Token 不存在或接口判定它无效时，都需要把用户引到设置页。
             const bool needs_token = !ok && error.find("Token") != std::string::npos;
-            PublishResult(ok, info, error, needs_token);
+            // 请求期间 Token 可能被改掉（设置页保存/清除），此时旧账号的数据必须丢弃。
+            const std::string current_token =
+                callbacks_.load_token ? callbacks_.load_token() : std::string();
+            const bool token_changed = current_token != token;
+            if (!token_changed) {
+                // 每日账单在请求任务里更新，避免把可能触发的 NVS 写入放到 LVGL 任务上。
+                if (ok && !info.entries.empty()) {
+                    balance_history::Update(info.entries.front(),
+                                            static_cast<int64_t>(std::time(nullptr)));
+                }
+                PublishResult(ok, info, error, needs_token);
+            } else {
+                ESP_LOGI(TAG, "Token 已变化，丢弃本次余额请求结果");
+            }
 
             // 以开始时间计时，这样一次慢请求不会把下一轮的间隔整体推后。
             next_fetch_us = fetch_started_us + kRefreshIntervalUs;
@@ -735,5 +787,12 @@ void DeepSeekBalanceUi::OnSettingsLinkClicked(lv_event_t* event) {
     auto* self = static_cast<DeepSeekBalanceUi*>(lv_event_get_user_data(event));
     if (self != nullptr && self->callbacks_.on_open_settings) {
         self->callbacks_.on_open_settings();
+    }
+}
+
+void DeepSeekBalanceUi::OnOpenBillClicked(lv_event_t* event) {
+    auto* self = static_cast<DeepSeekBalanceUi*>(lv_event_get_user_data(event));
+    if (self != nullptr && self->callbacks_.on_open_bill) {
+        self->callbacks_.on_open_bill();
     }
 }

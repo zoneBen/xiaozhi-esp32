@@ -430,6 +430,7 @@ void CatSettingsUi::ShowToast(const char* text) {
 
 void CatSettingsUi::SaveTokenFromEditor() {
     const char* text = lv_textarea_get_text(token_edit_);
+    const std::string previous_token = deepseek::LoadToken();
     std::string error;
     if (!deepseek::SaveToken(text != nullptr ? text : "", error)) {
         lv_label_set_text(token_error_, error.c_str());
@@ -441,7 +442,8 @@ void CatSettingsUi::SaveTokenFromEditor() {
     ShowSettingsPanel();
     UpdateTokenStatus();
     ShowToast("Token 已保存");
-    if (callbacks_.on_token_changed) {
+    // 原样重存同一个 Token 不该清掉已有的账单历史。
+    if (callbacks_.on_token_changed && previous_token != deepseek::LoadToken()) {
         callbacks_.on_token_changed();
     }
 }

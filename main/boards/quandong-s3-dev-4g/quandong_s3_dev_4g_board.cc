@@ -1,5 +1,6 @@
 #include "application.h"
 #include "assets/lang_config.h"
+#include "balance_history.h"
 #include "button.h"
 #include "codecs/es8311_audio_codec.h"
 #include "config.h"
@@ -24,16 +25,19 @@
 #include <atomic>
 #include <ctime>
 #include <memory>
+#include <mutex>
 
 #define TAG "QuandongS3Dev4GBoard"
 
 namespace {
 // 2025-01-01 UTC；低于它的时间视为还没同步。
 constexpr int64_t kMinValidTimestamp = 1735689600;
-// 余额基准在 NVS 里的有效期。
-constexpr int64_t kBaselineMaxAgeSec = 8 * 3600;
+// 后台账单任务的周期：每 10 分钟落盘一次。
+constexpr int64_t kHistoryIntervalMs = 10 * 60 * 1000;
+// 余额页在最近这段时间内更新过，后台任务就不重复请求，只负责落盘。
+constexpr int64_t kHistoryPageFreshSeconds = 5 * 60;
 // 开机后台任务最多等系统时间同步这么久。
-constexpr int kBaselineTimeWaitSeconds = 30;
+constexpr int kHistoryTimeWaitSeconds = 30;
 }  // namespace
 
 // ILI9341 厂家自定义初始化序列
@@ -75,8 +79,9 @@ private:
     QuandongS3Dev4GDisplay* display_ = nullptr;
     std::unique_ptr<Ft6336Touch> touch_;  // 触摸屏不存在时保持 nullptr
     NetworkEventCallback app_network_callback_;
-    std::atomic<bool> baseline_fetch_running_{false};
-    std::atomic<bool> baseline_boot_checked_{false};
+    std::mutex history_task_mutex_;
+    TaskHandle_t history_task_ = nullptr;
+    std::atomic<bool> history_force_fetch_{true};
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -265,31 +270,23 @@ private:
             });
     }
 
-    // 开机第一次联网时处理一次基准；运行中（包括断线重连）不更新已有基准。
-    // 没有基准时会重试，避免首次请求失败后整个开机周期都没有基准。
-    void StartBalanceBaselineFetch() {
-        deepseek::BaselineInfo info;
-        const bool has_baseline = deepseek::GetBaselineInfo(info);
-        if (has_baseline && baseline_boot_checked_.load()) {
+    // 联网后确保后台账单任务已启动。任务只在第一次创建，之后用通知叫醒它
+    // 立即采样（开机 / 重连 / Token 变化），其余时间每 10 分钟自己醒一次。
+    void EnsureHistoryTask() {
+        history_force_fetch_.store(true);
+        std::lock_guard<std::mutex> lock(history_task_mutex_);
+        if (history_task_ != nullptr) {
+            xTaskNotifyGive(history_task_);
             return;
         }
-        if (deepseek::LoadToken().empty()) {
-            return;
+        if (xTaskCreate(HistoryTaskEntry, "ds_history", 8192, this, 2, &history_task_) != pdPASS) {
+            history_task_ = nullptr;
+            ESP_LOGW(TAG, "创建余额账单任务失败");
         }
-        bool expected = false;
-        if (!baseline_fetch_running_.compare_exchange_strong(expected, true)) {
-            return;
-        }
-        if (xTaskCreate(BaselineTaskEntry, "ds_baseline", 8192, this, 2, nullptr) != pdPASS) {
-            baseline_fetch_running_.store(false);
-            ESP_LOGW(TAG, "创建余额基准任务失败");
-            return;
-        }
-        baseline_boot_checked_.store(true);
     }
 
     static int64_t WaitForValidTime() {
-        for (int i = 0; i < kBaselineTimeWaitSeconds; ++i) {
+        for (int i = 0; i < kHistoryTimeWaitSeconds; ++i) {
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             if (now >= kMinValidTimestamp) {
                 return now;
@@ -300,49 +297,66 @@ private:
         return now >= kMinValidTimestamp ? now : 0;
     }
 
-    void RunBalanceBaselineFetch() {
-        // 网络刚连上时系统时间可能还没从服务端同步，先等一会儿再判断 8 小时有效期。
-        const int64_t now = WaitForValidTime();
+    // 一次采样：余额页最近更新过就不重复请求；否则发一次 HTTP，
+    // 更新当天记录后立即落盘。
+    void RunHistoryCycle() {
+        const bool force_fetch = history_force_fetch_.exchange(false);
+        if (deepseek::LoadToken().empty()) {
+            return;
+        }
+
+        if (static_cast<int64_t>(std::time(nullptr)) < kMinValidTimestamp &&
+            WaitForValidTime() == 0) {
+            ESP_LOGW(TAG, "系统时间未同步，本次不记录余额账单");
+            return;
+        }
+
+        if (!force_fetch &&
+            balance_history::SecondsSinceUpdate() < kHistoryPageFreshSeconds) {
+            // 余额页正在轮询，数据是新的；这里只负责把 RAM 中的修改落盘。
+            balance_history::Flush();
+            return;
+        }
+
         const std::string token = deepseek::LoadToken();
-        deepseek::BaselineInfo info;
-        const bool has_baseline = deepseek::GetBaselineInfo(info);
-        const bool time_valid = now >= kMinValidTimestamp;
-
-        if (has_baseline && time_valid && info.timestamp > 0 &&
-            now - info.timestamp <= kBaselineMaxAgeSec) {
-            ESP_LOGI(TAG, "沿用 NVS 余额基准: %.2f %s, %lld 秒前", info.total,
-                     info.currency.c_str(), static_cast<long long>(now - info.timestamp));
-            baseline_fetch_running_.store(false);
-            return;
-        }
-        if (has_baseline && !time_valid) {
-            ESP_LOGW(TAG, "系统时间未同步，沿用 NVS 余额基准");
-            baseline_fetch_running_.store(false);
-            return;
-        }
-        if (token.empty()) {
-            baseline_fetch_running_.store(false);
-            return;
-        }
-
-        if (has_baseline) {
-            ESP_LOGI(TAG, "NVS 余额基准超过 8 小时，重新获取");
-        } else {
-            ESP_LOGI(TAG, "首次获取余额基准");
-        }
+        deepseek::BalanceInfo info;
         std::string error;
-        if (deepseek::FetchAndStoreBaseline(token, now, error, true)) {
-            ESP_LOGI(TAG, "余额基准已更新");
-        } else {
-            ESP_LOGW(TAG, "余额基准获取失败: %s", error.c_str());
+        if (!deepseek::FetchBalance(token, info, error)) {
+            ESP_LOGW(TAG, "后台余额采样失败: %s", error.c_str());
+            balance_history::Flush();
+            return;
         }
-        baseline_fetch_running_.store(false);
+        if (info.entries.empty()) {
+            ESP_LOGW(TAG, "后台余额采样没有返回数据");
+            balance_history::Flush();
+            return;
+        }
+        if (deepseek::LoadToken() != token) {
+            // 请求期间 Token 被改掉，这次响应属于旧账号，直接丢弃。
+            ESP_LOGI(TAG, "Token 已变化，丢弃本次后台余额采样");
+            balance_history::Flush();
+            return;
+        }
+
+        const int64_t fetched_at = static_cast<int64_t>(std::time(nullptr));
+        if (balance_history::Update(info.entries.front(), fetched_at)) {
+            balance_history::Flush();
+            ESP_LOGI(TAG, "余额账单已更新 (%s)", info.entries.front().currency.c_str());
+        } else {
+            balance_history::Flush();
+            ESP_LOGW(TAG, "余额账单更新失败（时间或金额无效）");
+        }
     }
 
-    static void BaselineTaskEntry(void* arg) {
-        auto* self = static_cast<QuandongS3Dev4GBoard*>(arg);
-        self->RunBalanceBaselineFetch();
-        vTaskDelete(nullptr);
+    void HistoryLoop() {
+        for (;;) {
+            RunHistoryCycle();
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kHistoryIntervalMs));
+        }
+    }
+
+    static void HistoryTaskEntry(void* arg) {
+        static_cast<QuandongS3Dev4GBoard*>(arg)->HistoryLoop();
     }
 
     // 设置页 / 余额页只做 UI，清配网和余额查询在板子里落地。
@@ -371,9 +385,10 @@ private:
                 },
             .on_token_changed =
                 [this]() {
-                    deepseek::ResetBaseline();
-                    baseline_boot_checked_.store(false);
-                    StartBalanceBaselineFetch();
+                    // Token 换了等于换了账号，旧账单不能继续和新余额混在一起。
+                    balance_history::ResetAll();
+                    history_force_fetch_.store(true);
+                    EnsureHistoryTask();
                 },
         });
     }
@@ -401,8 +416,8 @@ private:
         touch_->RegisterLvglIndev();
     }
 
-    // 触摸屏承担两个交互：左上角网络图标切换 WiFi / 4G，右上角齿轮打开设置页。
-    // 业务逻辑都留在板子里，显示层只提供 UI 能力。
+    // 触摸屏承担三类交互：左上角网络图标切换 WiFi / 4G，右上角账单按钮打开
+    // 今日消耗页，齿轮打开设置页。业务逻辑都留在板子里，显示层只提供 UI 能力。
     void InitializeNetworkSwitchByTouch() {
         display_->SetNetworkIconTappedHandler([this]() {
             auto& app = Application::GetInstance();
@@ -483,13 +498,13 @@ public:
     }
 
     // Application 只注册一个网络事件回调；这里包一层，在每次联网成功后
-    // 顺便尝试记录一次余额基准，再把事件原样转给 Application。
+    // 叫醒后台账单任务，再把事件原样转给 Application。
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) override {
         app_network_callback_ = std::move(callback);
         DualNetworkBoard::SetNetworkEventCallback(
             [this](NetworkEvent event, const std::string& data) {
                 if (event == NetworkEvent::Connected) {
-                    StartBalanceBaselineFetch();
+                    EnsureHistoryTask();
                 }
                 if (app_network_callback_) {
                     app_network_callback_(event, data);
